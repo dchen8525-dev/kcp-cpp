@@ -810,6 +810,25 @@ void TestWriteBuffersRejectsOversizedBatch() {
   if (n != -1 || ec != kcp::MakeErrorCode(ErrorCode::kInvalidArgument)) {
     Fail(__FILE__, __LINE__, "write_buffers: oversized batch not refused with kInvalidArgument");
   }
+  // Second oversized shape: several buffers that are each individually legal but sum past
+  // INT_MAX. The pre-check has to accumulate across buffers - a per-buffer-only check would
+  // wave this batch through and hand KCP a >2 GiB copy source. Like the single-buffer case,
+  // nothing is dereferenced, so this needs no allocation.
+  const std::size_t half = static_cast<std::size_t>((std::numeric_limits<int>::max)()) / 2 + 1;
+  const int m = pair.client->write_buffers(
+      {kcp::ConstBuffer{nullptr, half}, kcp::ConstBuffer{nullptr, half}}, &ec);
+  if (m != -1 || ec != kcp::MakeErrorCode(ErrorCode::kInvalidArgument)) {
+    Fail(__FILE__, __LINE__,
+         "write_buffers: multi-buffer oversized batch not refused with kInvalidArgument");
+  }
+  // An empty batch is legal and carries nothing: upstream kcp-go has no early return for it
+  // either (it falls through the window wait), so on a fresh session it must report 0/kOk
+  // rather than blocking or failing.
+  const int z = pair.client->write_buffers({}, &ec);
+  if (z != 0 || ec) {
+    Fail(__FILE__, __LINE__,
+         "write_buffers: empty batch misreported: n=" + std::to_string(z) + " ec=" + ec.message());
+  }
   // A refused batch must have queued nothing: the session still has to carry a normal write.
   const std::string ping = "ping";
   if (pair.client->write(ping.data(), ping.size(), &ec) != static_cast<int>(ping.size())) {

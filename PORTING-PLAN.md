@@ -1,6 +1,6 @@
 # kcp-cpp 移植计划 v5.12（参考 xtaci/kcp-go v5）
 
-> 状态：**实施中**（v5.12，累计 20 轮对抗分析（75 条）+ 命名合规审计 + 源码逐行核验 + 用户决策；**P0 ~ P7 已完成**，P8 已定义待开工，仅剩 Linux 实机回归（E1），见 §6）  
+> 状态：**实施中**（v5.14，累计 25 轮对抗分析（风险表 R1~R27）+ 命名合规审计 + 源码逐行核验 + 用户决策；**P0 ~ P8.0 已完成**，P8.1~P8.6 触发条件均未满足，仅剩 Linux 实机回归（E1），见 §6）  
 > 目标：将 D:\work\kcp-go（Go）完整移植为 C++17 库，输出到 D:\work\kcp-cpp，零第三方依赖。  
 > 已确认决策：① 加密层自包含实现；② Reed-Solomon 自实现；③ 验收含跨语言互通；  
 > ④ **定位 = 全量独立库**（含 session 层，与 kcp-proxy-cpp 解耦，集成另行议）；  
@@ -190,6 +190,19 @@
 | **138** | **P8.1 触发条件失效**："换 API 省 15~17 倍"在当前状态是 **1.3 倍**（`sendto` 3.4 µs vs `WSASendTo` 2.7 µs），按每数据报算只值 ~1 µs（<10% CPU）。按 P8 通用规则 4 记录为"当前不是主要瓶颈"，**不在当前状态实施**                                                                                                                                       | 实测    |
 | **139** | **P8.2/P8.3/P8.5/P8.6 触发条件按新表重算均未满足**（读路径系统调用 <15% CPU、无 >30% I/O 等待可省、P8.5 的前置链"P8.1/P8.3 先压下每包成本"未发生）。P8.4 仍依赖 E1                                                                                                                                                                        | 实测    |
 | **140** | **机器状态漂移写入方法论（§6.3）**：同一工作负载多次干净全量基线，`none` 单流 109.5 / 111.7 / 160.5 MB/s——run 内 min/max 很紧（±1%），run 间差 45%。旧基线恰逢一次"机器忙"窗口（当日 relay_test 同窗口 111 次重传），C++ 客户端 4 线程在该窗口塌到 12.8 MB/s 而 Go 的 IOCP 客户端同窗口仍有 122 MB/s——**线程多的实现在机器忙时先塌**。规则：跨会话基线结论必须来自同机会话内多轮中位数，单次测量不足以支撑 P8 排序                                            | 实测    |
+
+### v5.13 → v5.14 修订摘要（第 21~25 轮对抗分析：变异测试验证 + 四方向复审）
+
+**任务判定**：P8.1~P8.6 触发条件复算仍未满足、E1 被沙箱拉黑（WSL 无发行版）→ 无计划任务可推进，按用户规则执行 5 轮对抗分析。
+
+| 编号      | 修订                                                                                                                                                                                                                                                                                            | 依据    |
+| --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---- |
+| **141**   | **A1 变异测试**：对 run 2 的两个修复（R24 原子化 / R25 INT_MAX 预检）及关键不变量注入 5 个变异验证测试有效性。4 个可观察变异全部被杀：删除预检 → SEGFAULT；预检退化为逐块检查 → SEGFAULT（靠本轮新增的多缓冲区用例）；发送循环双重计数（run 2 实踩 bug）→ session_test 26 + relay_test 8 失败；`recv_n` 改 `store` → profiling `probe_n ∈ [rx_n-2, rx_n]` 带断言失败。第 5 个变异（IoCounters 退回普通 `uint64_t`）**存活**：单跑测试读在 join 之后，x64 对齐 64 位存取实践中不撕裂——该修复的价值是消除 UB（TSAN 可检，MSVC 无 TSAN），非行为变化，如实记录不夸大 | 实测    |
+| **142**   | **A2 TimedSched/Update 调度路径**：审定时堆、`wait_until` 丢失唤醒、任务重入（`Put` 不持锁跑用户码）、`Shutdown` 与 `Put` 竞态、`Update` 的 `Check()`→1 ms 钳制——全部安全。**发现并修复 R26**：`TimedSched::cpu_us_` 声明+访问器+注释齐全但无写入点（恒 0 的死代码，P8.0 引入），已删 | 实施    |
+| **143**   | **A3 Listener/握手/生命周期**：accept backlog 满即丢经上游 sess.go 证实为**忠实行为**（`acceptBacklog=128`、发送前 `len>=cap` 检查、单发送者无竞态）；`CloseSession` 按 key 擦除经推证安全（`close()` 恰好一次、conv 重置路径先关后插）；OOB 回调 `len-8-4` 下溢不可达（会话与 listener 两条路径都在 `KcpInput` 前强制 `len >= min(kOverhead, 8+4)=12`，与上游 `min(IKCP_OVERHEAD, fecHeaderSizePlus2+convSize)` 一致）；`Control` 持锁调用户函数为头文件明示行为。**未发现缺陷** | 实测    |
+| **144**   | **A4 FEC/RS 解码**：`FECShardSet` 同时被 `fetch_add`（建 set）与 `store`（`discardShards` 末）写——上游 fec.go 逐字同款（Add 恒被随后的 Store 覆盖，实为 gauge），C++ 已有注释，不动作；`ShardHeap::Push` 不去重由调用方 `Has` 先行——与上游一致；`seqid >= paws` 早退与上游一致；auto-tune（`shouldTune`）不实现为已登记决策 #108；RS `ReconstructImpl` 的 MDS 子矩阵选择与行变换数学验证正确。**未发现缺陷** | 实测    |
+| **145**   | **A5 Crypt/platform/构建**：GCM tag 比较为常量时间（`ConstantTimeEqual`）且先验证后解密；nonce 每包 `FillRand`（BCryptGenRandom→getrandom→/dev/urandom→响亮告警的 splitmix64 降级）；CFB 校验和覆盖范围与 sess.go:735 一致；`SocketAddress::mutable_size()` 返回全容量 128（v6 peer 不会被静默丢弃）；`/W4` 全量零警告。**未发现缺陷** | 实测    |
+| **146**   | **方法论固化**：变异测试作为修复的验收环节——"改了安全代码"必须回答"哪个测试能在回归时失败"。本轮同时示范了变异存活的诚实处置（R24 的 UB 修复无单跑可观察行为，记录而非伪装成被测试保护） | 方法论  |
 
 ---
 
@@ -1171,6 +1184,8 @@ socket RAII（**platform/socket 双实现**，决策⑤）→ ringbuffer/`Blocki
 | R23 | **per-call 系统调用成本随 API 变化一个数量级**（`sendto` 44 µs vs `WSASendTo` 2.6 µs，仅 Windows；Linux 上 `sendto` 本就是 1~2 µs 量级） | `bench/syscall_cost` 把每个调用单独定价（墙钟 + CPU 双时钟），`run_bench.py` 每次基线都重跑它，数字不会过期；P8 每一项都以它做前后对照。**教训**：先给每个系统调用定价，再讨论算法/协议/加密，否则会把 I/O 成本误记到协议头上 |
 | R24 | **profile 计数器非原子**（P8.0 仪器化引入：I/O 线程在 `SysSendTo`/`SysRecvFrom`/`SysWaitReadable` 裸写 `IoCounters`，用户线程 `profile()` 裸读；现状靠"close() 后读"的文档契约 + join 的 happens-before 缓解，但 API 不强制，中途读即数据竞争） | 10 个字段全部改 `std::atomic<uint64_t>`（relaxed）：写侧 `fetch_add`、读侧 `load`；每数据报多一次 locked RMW，相对 2.6 µs 的 `WSASendTo` 是噪声。`TestProfilingCountersDoNotBreakTransfer` 钉住自洽性（`probe_n ∈ [rx_n-2, rx_n]`） |
 | R25 | **`write_buffers` 批次字节数 int 溢出**（单批 >2 GB：`total += static_cast<int>(view.len)` 有符号溢出（UB），回绕负值冒充成功字节数；上游 Go 的 int 为 64 位会接受该批次） | 批次总量以 `size_t` 预累加 + 预检，超 INT_MAX 一律 `kInvalidArgument`：不入队、不持锁、会话保持可用（>2 GB 的 KCP 报文在 UDP 上本不可达，确定化拒绝是安全移植）。`TestWriteBuffersRejectsOversizedBatch` 用 `nullptr` + `INT_MAX+1` 长度做零分配回归，并验证拒绝后普通写入仍可达对端 |
+| R26 | **"声明了但没人写"的仪器化死代码**（P8.0 引入 `TimedSched::cpu_us_`：头文件注释称"每任务后重发布"，`cpu_us()` 访问器齐全，但全仓无任何写入点，恒返回 0；session 的 update CPU 已由 `update_cpu_us_`（CpuScope 在回调内）覆盖，该成员纯冗余） | 删除成员 + 访问器 + 失效注释与 `profile.h` 包含；由变异测试方法学发现——**对修复做变异验证测试有效性**时逐一核对"文档声明的行为是否有代码兑现"。教训：仪器化代码的文档声明（计数器语义、发布时机）必须与写入点一起 review，否则留下恒零的"测量" |
+| R27 | **测试覆盖的"形状缺口"**（`write_buffers` 超限预检只测了单缓冲区 >INT_MAX；把预检退化成逐块检查的变异可存活——多块各合法、总和超限的批次会被放行后 Crash） | 补两个零分配用例：① 2 × (INT_MAX/2+1) 多缓冲区累加超限（同样期望 `kInvalidArgument`）② 空批次返回 0/kOk（上游亦无早退，钉住当前语义）。变异验证：逐块检查变异 → SEGFAULT 被杀；删除预检 → SEGFAULT 被杀；发送循环双重计数（run 2 实踩 bug）→ session_test 26 + relay_test 8 失败被杀；`recv_n` 改 `store` → profiling 带断言被杀 |
 
 ---
 
