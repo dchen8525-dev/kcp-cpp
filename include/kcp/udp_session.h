@@ -28,6 +28,7 @@
 #include "kcp/internal/fec.h"
 #include "kcp/internal/rate_limiter.h"
 #include "kcp/kcp.h"
+#include "kcp/platform/profile.h"
 #include "kcp/platform/socket.h"
 
 namespace kcp {
@@ -39,6 +40,40 @@ class UdpSession;
 struct ConstBuffer {
   const void* data = nullptr;
   std::size_t len = 0;
+};
+
+// Cumulative cost accounting for one session (PORTING-PLAN.md P8.0). Two different clocks are kept
+// apart on purpose:
+//
+//   *_cpu_us       CPU time, from GetThreadTimes / CLOCK_THREAD_CPUTIME_ID
+//   tx_us/rx_us    wall time spent inside the syscall, from two clock reads around it
+//
+// The split is what makes the difference between "burned a core" and "waited" visible: sendto()
+// spends only half of its 44 us on CPU on Windows, and no CPU-time meter would ever show that.
+//
+// Thread attribution: the read and post threads are owned by the session, so their buckets are
+// whole-thread totals. Update() runs on the shared TimedSched thread, so it is charged per call
+// instead. A session owned by a Listener reads on the listener's monitor thread, which this object
+// cannot see: read_thread_cpu_us stays 0 there, and so do the rx counters.
+struct SessionProfile {
+  std::uint64_t read_thread_cpu_us = 0;  // ReadLoop: wait + recvfrom + decrypt + Kcp::Input
+  std::uint64_t post_thread_cpu_us = 0;  // PostProcess: FEC + CRC + encrypt + Tx
+  std::uint64_t update_cpu_us = 0;       // Update() callbacks, including the flush they trigger
+  std::uint64_t write_cpu_us = 0;        // inside write()/write_buffers(), on the calling thread
+  std::uint64_t write_calls = 0;
+  std::uint64_t read_cpu_us = 0;  // inside read(), on the calling thread
+  std::uint64_t read_calls = 0;
+
+  std::uint64_t tx_n = 0;  // SysSendTo calls (one per datagram, including duplicates and parity)
+  std::uint64_t tx_us = 0;
+  std::uint64_t tx_err = 0;
+  std::uint64_t rx_n = 0;  // SysRecvFrom calls (including the ones that found nothing)
+  std::uint64_t rx_us = 0;
+  std::uint64_t rx_err = 0;
+  std::uint64_t probe_n = 0;  // SysWaitReadable(fd, 0): the per-datagram readiness probe
+  std::uint64_t probe_us = 0;
+  std::uint64_t wait_n = 0;  // SysWaitReadable(fd, 50 ms): idle unless the loop is saturated
+  std::uint64_t wait_us = 0;
 };
 
 // Deadlines are monotonic, because a wall-clock jump would otherwise turn a 100 ms timeout into an
@@ -127,6 +162,17 @@ class UdpSession : public std::enable_shared_from_this<UdpSession> {
   void SetPacketTrace(PacketTrace trace);
 
   // ---- introspection -------------------------------------------------------------------------
+
+  // Turns on the accounting described by SessionProfile (PORTING-PLAN.md P8.0). Off by default:
+  // while it is off the syscall wrappers pay one relaxed atomic load per datagram; while it is on
+  // they pay two wall-clock reads (~21 ns each) and the worker loops pay two thread-clock reads
+  // (~102 ns each, `bench/syscall_cost` CLOCK line).
+  //
+  // Enable before the traffic starts - the totals only cover the window it was on for. Read
+  // profile() after close(), when both worker threads have been joined; the counters are written
+  // by four different threads and there is no attempt to make a mid-flight snapshot coherent.
+  void EnableProfiling();
+  SessionProfile profile() const;
 
   std::uint32_t conv() const;
   std::uint32_t rto() const;
@@ -246,6 +292,19 @@ class UdpSession : public std::enable_shared_from_this<UdpSession> {
 
   // Read with atomic_load in the two I/O loops; see SetPacketTrace.
   std::shared_ptr<const PacketTrace> packet_trace_;
+
+  // P8.0 accounting. `io_` is installed on both worker threads; each writes only its own half (the
+  // post thread the send counters, the read thread the recv/probe/wait ones), so no two threads
+  // touch the same field.
+  platform::IoCounters io_;
+  std::atomic<bool> profiling_{false};
+  std::atomic<std::uint64_t> read_thread_cpu_us_{0};
+  std::atomic<std::uint64_t> post_thread_cpu_us_{0};
+  std::atomic<std::uint64_t> update_cpu_us_{0};
+  std::atomic<std::uint64_t> write_cpu_us_{0};
+  std::atomic<std::uint64_t> write_calls_{0};
+  std::atomic<std::uint64_t> read_cpu_us_{0};
+  std::atomic<std::uint64_t> read_calls_{0};
 };
 
 // ---- package-level constructors (sess.go:1430-1528) -------------------------------------------

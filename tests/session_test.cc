@@ -737,6 +737,62 @@ void TestListenerSurvivesPeerDisappearing() {
   listener->close(nullptr);
 }
 
+// P8.0 regression guard: the accounting instrumentation (SessionProfile / IoCounters / CpuScope)
+// must not disturb the pipeline it measures. A transfer with profiling on has to land byte-exact,
+// and the counters it leaves behind have to be self-consistent: ACK traffic must come back for the
+// window to move (rx_n > 0), and the readiness probes must sit inside the drain pattern's window
+// (ReadLoop probes after each receive, so probe_n is within two of rx_n - the slack covers one
+// close() race and one EWOULDBLOCK). The CPU buckets are deliberately not asserted - Windows
+// GetThreadTimes advances in 15.6 ms ticks and a 1 MiB loopback transfer is shorter than two of
+// them, so a non-zero assertion there would be a coin flip. The closure gate lives in
+// tools/bench/profile_split.py over 100 MiB runs, where the quantization is negligible.
+void TestProfilingCountersDoNotBreakTransfer() {
+  Pair pair;
+  if (!Establish(&pair, kcp::Crypt{}, 0, 0, "profiling")) {
+    return;
+  }
+  pair.client->EnableProfiling();
+  if (!Transfer(pair, 1024 * 1024, 32 * 1024, "profiling")) {
+    pair.client->close(nullptr);
+    pair.server->close(nullptr);
+    return;
+  }
+
+  // Close both ends first: profile() is only coherent once the worker threads have joined (the
+  // counters are written by four threads and a mid-flight snapshot is meaningless by design).
+  pair.client->close(nullptr);
+  pair.server->close(nullptr);
+
+  const kcp::SessionProfile p = pair.client->profile();
+  if (p.tx_n == 0) {
+    Fail(__FILE__, __LINE__, "profiling: no sendto counted for a 1 MiB transfer");
+  }
+  // This test's peer only reads, so what comes back is ACK traffic, not echoes: the window cannot
+  // move without it, hence rx_n > 0 (the echo-shaped invariant rx_n >= tx_n belongs to the
+  // echo_client workload, where tools/bench/profile_split.py checks it).
+  if (p.rx_n == 0) {
+    Fail(__FILE__, __LINE__,
+         "profiling: no recvfrom counted - ACKs must come back for the window to move");
+  }
+  // Drain pattern (ReadLoop): select(50ms) -> recvfrom -> select(0) per datagram, so a probe
+  // follows every receive except the one a close() or an EWOULDBLOCK lands on. The structurally
+  // guaranteed window is therefore probe_n in [rx_n - 2, rx_n].
+  if (p.probe_n > p.rx_n || p.probe_n + 2 < p.rx_n) {
+    Fail(__FILE__, __LINE__,
+         "profiling: probe_n " + std::to_string(p.probe_n) + " vs rx_n " + std::to_string(p.rx_n) +
+             " outside the drain pattern's [rx_n - 2, rx_n]");
+  }
+  if (p.write_calls == 0) {
+    Fail(__FILE__, __LINE__, "profiling: write() calls not counted");
+  }
+  // The listener-owned server session reads on the monitor thread, which installs no counters:
+  // read_thread_cpu_us stays 0 there by design (documented on SessionProfile).
+  const kcp::SessionProfile server_profile = pair.server->profile();
+  if (server_profile.read_thread_cpu_us != 0) {
+    Fail(__FILE__, __LINE__, "profiling: listener session charged CPU to a thread it cannot see");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -758,6 +814,7 @@ int main() {
   TestSocketOptionMatrix();
   TestSetMtu();
   TestCurrEstabAccounting();
+  TestProfilingCountersDoNotBreakTransfer();
 
   if (g_failures != 0) {
     std::fprintf(stderr, "session_test: %d failure(s)\n", g_failures);

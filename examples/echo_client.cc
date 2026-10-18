@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "echo_common.h"
+#include "kcp/platform/profile.h"
 #include "kcp/snmp.h"
 #include "kcp/udp_session.h"
 
@@ -66,6 +67,9 @@ int main(int argc, char** argv) {
       dump.Record(outgoing, data, len);
     });
   }
+  if (options.profile) {
+    session->EnableProfiling();
+  }
   session->SetDeadline(std::chrono::steady_clock::now() +
                        std::chrono::milliseconds(options.timeout_ms));
 
@@ -76,10 +80,18 @@ int main(int argc, char** argv) {
       static_cast<std::int64_t>(options.bytes) * static_cast<std::int64_t>(options.iters);
 
   const auto start = std::chrono::steady_clock::now();
+  // P8.0: the CPU window opens here. Three threads do the client's work - this one (read + verify),
+  // the writer (write -> Kcp::Send), and the session's own read/post threads, which account for
+  // themselves - so measuring the first two whole-thread is enough to close the books.
+  const std::uint64_t profile_wall_start = kcp::platform::WallMicros();
+  const std::uint64_t profile_main_start = kcp::platform::ThreadCpuMicros();
+  const std::uint64_t profile_proc_start = kcp::platform::ProcessCpuMicros();
 
   // Writer thread: pushes the whole stream without waiting for echoes, exactly like the Go client.
   std::string write_error_text;
+  std::uint64_t writer_cpu_us = 0;
   std::thread writer([&]() {
+    const std::uint64_t cpu_start = kcp::platform::ThreadCpuMicros();
     const std::size_t chunk = static_cast<std::size_t>(options.chunk);
     std::int64_t written = 0;
     while (written < total) {
@@ -91,10 +103,11 @@ int main(int argc, char** argv) {
       const int n = session->write(payload.data() + offset, take, &write_ec);
       if (n < 0) {
         write_error_text = write_ec.message();
-        return;
+        break;
       }
       written += n;
     }
+    writer_cpu_us = kcp::platform::ThreadCpuMicros() - cpu_start;
   });
 
   // Reader: message mode returns one message at a time (§3.6), so accumulate until the stream ends.
@@ -168,5 +181,36 @@ int main(int argc, char** argv) {
       static_cast<unsigned long long>(snmp.lost_segs),
       static_cast<unsigned long long>(snmp.fec_recovered), srtt_us / 1000.0);
   std::fflush(stdout);
+
+  // P8.0 decomposition. Raw numbers only: the arithmetic that turns them into us-per-datagram
+  // lives in tools/bench/profile_split.py so the same fold is applied to every measurement instead
+  // of being retyped. The CPU window closes after close() so the tail flush is inside it; `span_us`
+  // is therefore a few ms longer than the throughput window in RESULT.
+  if (options.profile) {
+    const kcp::SessionProfile p = session->profile();
+    const std::uint64_t span_us = kcp::platform::WallMicros() - profile_wall_start;
+    const std::uint64_t main_cpu_us = kcp::platform::ThreadCpuMicros() - profile_main_start;
+    const std::uint64_t proc_cpu_us = kcp::platform::ProcessCpuMicros() - profile_proc_start;
+    std::printf(
+        "PROFILE span_us=%llu out_pkts=%llu proc_cpu_us=%llu main_cpu_us=%llu "
+        "writer_cpu_us=%llu read_thread_cpu_us=%llu post_thread_cpu_us=%llu update_cpu_us=%llu "
+        "wcall_n=%llu wcall_cpu_us=%llu rcall_n=%llu rcall_cpu_us=%llu tx_n=%llu tx_us=%llu "
+        "rx_n=%llu rx_us=%llu probe_n=%llu probe_us=%llu wait_n=%llu wait_us=%llu\n",
+        static_cast<unsigned long long>(span_us), static_cast<unsigned long long>(snmp.out_pkts),
+        static_cast<unsigned long long>(proc_cpu_us), static_cast<unsigned long long>(main_cpu_us),
+        static_cast<unsigned long long>(writer_cpu_us),
+        static_cast<unsigned long long>(p.read_thread_cpu_us),
+        static_cast<unsigned long long>(p.post_thread_cpu_us),
+        static_cast<unsigned long long>(p.update_cpu_us),
+        static_cast<unsigned long long>(p.write_calls),
+        static_cast<unsigned long long>(p.write_cpu_us),
+        static_cast<unsigned long long>(p.read_calls),
+        static_cast<unsigned long long>(p.read_cpu_us), static_cast<unsigned long long>(p.tx_n),
+        static_cast<unsigned long long>(p.tx_us), static_cast<unsigned long long>(p.rx_n),
+        static_cast<unsigned long long>(p.rx_us), static_cast<unsigned long long>(p.probe_n),
+        static_cast<unsigned long long>(p.probe_us), static_cast<unsigned long long>(p.wait_n),
+        static_cast<unsigned long long>(p.wait_us));
+    std::fflush(stdout);
+  }
   return 0;
 }

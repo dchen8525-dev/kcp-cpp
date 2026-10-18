@@ -8,6 +8,7 @@
 #ifndef KCP_INTERNAL_TIMEDSCHED_H_
 #define KCP_INTERNAL_TIMEDSCHED_H_
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -53,6 +54,14 @@ class TimedSched {
   // Tasks still queued. Used by tests; not part of the session hot path.
   std::size_t size() const;
 
+  // CPU time this worker has burned so far, in microseconds (PORTING-PLAN.md P8.0).
+  //
+  // Process-wide, because the worker is: with N sessions it is the sum over all of them, which is
+  // what a closure check against process CPU needs. Republished after every task, so it lags by at
+  // most one scheduling interval. Whole-thread rather than per-callback on purpose - a per-callback
+  // GetThreadTimes delta cannot resolve anything below the 15.6 ms clock tick.
+  std::uint64_t cpu_us() const { return cpu_us_.load(std::memory_order_relaxed); }
+
  private:
   struct Task {
     TimePoint due;
@@ -76,6 +85,7 @@ class TimedSched {
   std::priority_queue<Task, std::vector<Task>, Later> tasks_;
   std::uint64_t next_seq_ = 0;
   bool stopped_ = false;
+  std::atomic<std::uint64_t> cpu_us_{0};
   std::thread worker_;
 };
 

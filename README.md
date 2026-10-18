@@ -70,68 +70,66 @@ dropped, median reported). It drives `examples/echo_*` and `tools/interop/goecho
 parameters** — conv=1, mtu 1400, no-delay(1,10,2,1), snd/rcv window 32/32 — because the kcp-go
 defaults differ from the ported ones and a baseline with different defaults is not a baseline.
 
-Headline numbers on Windows x64 loopback (median of 5):
+Headline numbers on Windows x64 loopback (median of 5, `bench.md`, 2026-10-18 late session):
 
 | config | C++ single | Go single | C++ 10 streams | Go 10 streams |
 |---|---|---|---|---|
-| none, fec off | 12.2 MB/s | 119.5 MB/s | 10.9 MB/s | 52.4 MB/s |
-| aes-gcm, fec 10/3 | 8.4 MB/s | 112.1 MB/s | 8.5 MB/s | 48.6 MB/s |
-| salsa20, fec 10/3 | 9.0 MB/s | 86.3 MB/s | 8.7 MB/s | 47.3 MB/s |
+| none, fec off | 111.7 MB/s | 118.6 MB/s | 64.0 MB/s | 65.5 MB/s |
+| aes-gcm, fec 10/3 | 45.7 MB/s | 147.0 MB/s | 36.0 MB/s | 66.6 MB/s |
+| salsa20, fec 10/3 | 59.6 MB/s | 85.5 MB/s | 46.3 MB/s | 64.6 MB/s |
 
-**Attribution (R7), measured rather than argued** — the shortfall is per-datagram I/O cost, not the
-protocol, the cipher or Reed-Solomon:
+**Machine-state caveat (measured, not assumed)**: the same workload on this machine varies ±30%
+between clean runs (109.5 / 111.7 / 160.5 MB/s for `none` single across three baselines, while
+within-run min/max is ±1%). Quote a baseline only together with its `bench/syscall_cost`
+calibration line — that is the fingerprint of the machine state it was taken in. The numbers above
+are from one 5-round run; re-run before drawing conclusions.
 
-* `bench/kcp_pump` runs two `Kcp` instances in one thread with no sockets: 0.8–2.2 GB/s, i.e. two
-  orders of magnitude above the session layer.
-* `bench/aes_bench`: AES-CFB at 1262 MB/s (AES-NI) / 331 MB/s (T-table); AES-GCM at 168 MB/s.
-* `bench/udp_pingpong`: one cross-thread UDP round trip costs 86 µs on this machine — that is what a
-  single OS wake-up costs.
-* **The window is not the limit**: 32 / 128 / 512 gives 13.1 / 13.5 / 12.2 MB/s. A 16x wider window
-  changes nothing, so the ceiling is per-datagram cost, not bytes in flight.
-* Fold the numbers out: 12.2 MB/s is **8.9k datagrams/s per direction, ~112 µs per datagram**, against
-  **11.5 µs** for Go at the same parameters.
-* **Then price the calls instead of guessing** (`bench/syscall_cost`, wall clock *and* process CPU):
+**Attribution, measured rather than argued** — P8.0 (`tools/bench/profile_split.py`) decomposes one
+100 MiB run into five CPU budgets (read thread / post thread / update callback / writer / reader)
+plus per-syscall counts, and the books close within 10% of process CPU (-0.8% to -2.5% across the
+three configs). For `none fec=0/0` at 148.6 MB/s in one profiled run:
 
-  | call | wall | CPU |
-  |---|---|---|
-  | `sendto()` — what this port uses today | 41–46 µs | 21 µs |
-  | `WSASendTo()`, null `OVERLAPPED` (synchronous) | 2.6 µs | 2.9 µs |
-  | `WSASendTo()`, overlapped, waited | 3.0 µs | 2.9 µs |
-  | `send()` on a connected socket | 2.5 µs | 2.0 µs |
-  | `recvfrom()` | 1.0 µs | — |
-  | readiness probe (`select(0)`) the drain loop pays per datagram | 0.75 µs | — |
-
-  Same datagram, same destination address, same socket flags: **`sendto` costs 15–17x what
-  `WSASendTo` costs.** Three controls rule out the obvious explanations — a null `OVERLAPPED` is
-  synchronous and still 2.6 µs (so it is not the async path), `WSASendTo` takes the same address
-  argument (so it is not the address lookup), and a connected `send()` agrees. The CPU column says
-  where the time goes: only 21 of `sendto`'s 44 µs is CPU, the rest is the thread not running, i.e.
-  a wait inside the call.
-* Corroborated across runtimes (`tools/interop/syscallprobe`): Go's *unconnected* `WriteTo` is
-  2.9 µs, Python's `sendto` is 45 µs. It is the API on this platform, not the language runtime.
+* **13.3 µs CPU per datagram, spread evenly**: read thread 33% (`recvfrom` + decrypt +
+  `Kcp::Input`), post thread 33% (FEC + CRC + encrypt + `Tx`), reader 30% (`read` + verify),
+  writer 2% (`write` → `Kcp::Send`), update callback ~0%.
+* **Syscalls are a small slice**: `sendto` 2.88 µs/call, `recvfrom` 0.63, readiness probe 1.08 —
+  together ~4.7 µs of the 5.1 µs wall per datagram, and a minor part of the 13.3 µs CPU. There is
+  no single dominant segment left to attack, which is why every P8 item below carries a trigger.
+* Still true from P6: the protocol engine is not the limit (`bench/kcp_pump`, 0.8–2.1 GB/s) and
+  the read path is not the limit.
+* A previous attribution of this section — "`sendto` costs 41–46 µs, 15–17x `WSASendTo`, hence
+  112 µs/datagram" — was measured during a busy-machine window on 2026-10-18 evening and **does
+  not reproduce**: same machine, same code (verified against the committed build, 109.5 MB/s),
+  `sendto` prices at 3.4 µs today and the API gap is 1.3x. The Go↔Go baseline was stable across
+  both windows (119.5 → 118.6 MB/s) while the C++ client — four threads — collapsed 10x under
+  load where Go's IOCP client did not: thread-heavy implementations fall over first on a busy
+  machine. Kept here as a record; `PORTING-PLAN.md` §6.3.1/§6.3.2 carry the full story.
 
 Two numbers that look like regressions but are not, both recorded so nobody re-litigates them:
 
-* **One-way (`-discard`) is 2.48 MB/s, five times slower than echo.** With nothing to send back the
-  receiver's ACKs cannot piggyback, so they wait for the `interval`=10 ms flush tick, which the
-  Windows timer granularity stretches to ~17 ms. That is KCP's design, not this port's.
+* **One-way (`-discard`) is far slower than echo** (2.48 MB/s in the P6 window). With nothing to
+  send back the receiver's ACKs cannot piggyback, so they wait for the `interval`=10 ms flush
+  tick, which the Windows timer granularity stretches to ~17 ms. That is KCP's design, not this
+  port's.
 * **AES-GCM's AES-NI advantage is only 1.37x, not 3.81x.** GHASH is a 4-bit table
-  (`src/internal/gcm.cc:81-113`) with no PCLMULQDQ path yet. Irrelevant at 8.4 MB/s, listed for P8.
+  (`src/internal/gcm.cc:81-113`) with no PCLMULQDQ path yet. At 168 MB/s against a 45.7 MB/s
+  session it is not yet the bottleneck (P8.5's trigger includes its precondition chain, which has
+  not happened).
 
-P8 is now defined in `PORTING-PLAN.md` with gates, trigger conditions and a kill line per item:
+P8 in `PORTING-PLAN.md`, after P8.0's table:
 
-1. **P8.0** instrument it first — per-thread CPU and per-call time, and the ledger has to add up
-   (the three thread budgets within 10% of the process total). No item below starts without it.
-2. **P8.1** `sendto` → `WSASendTo` on Windows. ~41 µs → ~2.6 µs per datagram, measured.
-3. **P8.2** drop the per-datagram `select(0)` probe (worth ~0.5 µs — the read path is *not* the
-   bottleneck, which is exactly why this is listed but gated).
-4. **P8.3** IOCP, only if P8.0 still shows I/O waiting above 30% of per-datagram cost.
+1. **P8.0 — done.** Instrumentation (`kcp::UdpSession::EnableProfiling`), the fold script
+   (`tools/bench/profile_split.py`), and the §6.3.2 ledger. Its finding: the 25 MB/s target line
+   is already exceeded 4.5x, and no single segment dominates.
+2. **P8.1** `sendto` → `WSASendTo`: **trigger invalidated** — the 15–17x gap is 1.3x today
+   (~1 µs/datagram). Recorded as "not the bottleneck now", not implemented.
+3. **P8.2** drop the per-datagram `select(0)` probe: read-path syscalls are <15% of CPU — trigger
+   not met.
+4. **P8.3** IOCP: only if I/O waiting still exceeds 30% of per-datagram cost after P8.1 — there is
+   no such waiting to save.
 5. **P8.4** `recvmmsg`/`sendmmsg` on Linux (D4) — Linux only, and only once E1 can run.
-6. **P8.5** GHASH via PCLMULQDQ (gated on GCM reaching 40 MB/s). **P8.6** RS views (gated on FEC
-   exceeding 10% of per-datagram cost).
-
-The old guess in this section — "this port pays two syscalls per datagram" — was half right. The
-second syscall costs 0.75 µs; the first one costs 41 µs.
+6. **P8.5** GHASH via PCLMULQDQ, **P8.6** RS views — triggers not met (see PORTING-PLAN.md
+   §6.3.2 for the per-item arithmetic).
 
 ## Tests
 

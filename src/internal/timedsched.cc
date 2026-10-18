@@ -9,6 +9,8 @@
 
 #include <utility>
 
+#include "kcp/platform/profile.h"
+
 namespace kcp {
 namespace internal {
 

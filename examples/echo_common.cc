@@ -191,6 +191,10 @@ bool ParseOptions(int argc, char** argv, Options* out, std::string* error) {
       out->discard = true;
       continue;
     }
+    if (flag == "profile" && !has_inline_value) {
+      out->profile = true;
+      continue;
+    }
 
     if (!has_inline_value) {
       if (i + 1 >= argc) {

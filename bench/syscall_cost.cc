@@ -36,6 +36,7 @@
 #include <winsock2.h>
 #endif
 
+#include "kcp/platform/profile.h"
 #include "kcp/platform/socket.h"
 
 namespace {
@@ -399,6 +400,29 @@ int main(int argc, char** argv) {
   std::printf("  overlapped waited=%zu pending=%zu connected=%zu of %d\n", ov_done, ov_done,
               conn_done, drain);
 #endif
+
+  // Instrumentation cost. P8.0 charges CPU to whole loops and to single public calls, so the price
+  // of a clock read must be known: a meter that costs more than the thing it measures is worse
+  // than no meter. ThreadCpuMicros() is a syscall (GetThreadTimes / clock_gettime), WallMicros()
+  // reads a shared counter page.
+  std::uint64_t sink = 0;
+  auto c0 = Clock::now();
+  for (int i = 0; i < send_iters; ++i) {
+    sink += kcp::platform::WallMicros();
+  }
+  const double wall_clock_us =
+      MicrosPerCall(Clock::now() - c0, static_cast<std::size_t>(send_iters));
+  c0 = Clock::now();
+  for (int i = 0; i < send_iters; ++i) {
+    sink += kcp::platform::ThreadCpuMicros();
+  }
+  const double thread_clock_us =
+      MicrosPerCall(Clock::now() - c0, static_cast<std::size_t>(send_iters));
+  std::printf("CLOCK wall_micros_us=%.3f thread_cpu_micros_us=%.3f\n", wall_clock_us,
+              thread_clock_us);
+  if (sink == 0) {
+    std::printf("  clock reads returned zero\n");
+  }
 
   kcp::platform::SysClose(rx);
   kcp::platform::SysClose(tx);

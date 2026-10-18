@@ -11,39 +11,39 @@ CPU is the client side only, as a percentage of one core over the run.
 
 | config | scenario | impl | MB/s (median) | min | max | CPU % | srtt ms |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| none fec=0/0 | single | cpp | 12.2 | 11.6 | 12.8 | 79 | 0.001 |
-| none fec=0/0 | single | go | 119.5 | 117.6 | 199.5 | 270 | 0.000 |
-| none fec=0/0 | concurrent | cpp | 10.9 | 10.0 | 11.2 | 166 | 0.020 |
-| none fec=0/0 | concurrent | go | 52.4 | 50.8 | 54.7 | 518 | 0.000 |
-| aes-gcm fec=10/3 | single | cpp | 8.4 | 8.0 | 8.5 | 85 | 0.003 |
-| aes-gcm fec=10/3 | single | go | 112.1 | 88.0 | 149.0 | 273 | 0.000 |
-| aes-gcm fec=10/3 | concurrent | cpp | 8.5 | 8.4 | 8.6 | 164 | 0.033 |
-| aes-gcm fec=10/3 | concurrent | go | 48.6 | 48.0 | 50.0 | 445 | 0.000 |
-| salsa20 fec=10/3 | single | cpp | 9.0 | 9.0 | 9.2 | 79 | 0.002 |
-| salsa20 fec=10/3 | single | go | 86.3 | 85.2 | 129.0 | 245 | 0.000 |
-| salsa20 fec=10/3 | concurrent | cpp | 8.7 | 8.3 | 8.8 | 169 | 0.030 |
-| salsa20 fec=10/3 | concurrent | go | 47.3 | 41.7 | 48.4 | 521 | 0.000 |
+| none fec=0/0 | single | cpp | 111.7 | 110.6 | 112.0 | 244 | 0.000 |
+| none fec=0/0 | single | go | 118.6 | 117.6 | 202.9 | 267 | 0.000 |
+| none fec=0/0 | concurrent | cpp | 64.0 | 38.9 | 64.3 | 241 | 0.001 |
+| none fec=0/0 | concurrent | go | 65.5 | 60.1 | 78.5 | 195 | 0.000 |
+| aes-gcm fec=10/3 | single | cpp | 45.7 | 44.5 | 46.4 | 220 | 0.001 |
+| aes-gcm fec=10/3 | single | go | 147.0 | 131.1 | 149.9 | 269 | 0.000 |
+| aes-gcm fec=10/3 | concurrent | cpp | 36.0 | 35.4 | 36.3 | 272 | 0.003 |
+| aes-gcm fec=10/3 | concurrent | go | 66.6 | 66.0 | 67.8 | 203 | 0.000 |
+| salsa20 fec=10/3 | single | cpp | 59.6 | 58.3 | 60.8 | 216 | 0.001 |
+| salsa20 fec=10/3 | single | go | 85.5 | 85.2 | 85.6 | 243 | 0.000 |
+| salsa20 fec=10/3 | concurrent | cpp | 46.3 | 40.0 | 48.0 | 278 | 0.001 |
+| salsa20 fec=10/3 | concurrent | go | 64.6 | 37.6 | 69.3 | 202 | 0.000 |
 
 ## Ratio against the Go baseline
 
 | config | scenario | cpp / go |
 | --- | --- | --- |
-| none fec=0/0 | single | 0.10x |
-| none fec=0/0 | concurrent | 0.21x |
-| aes-gcm fec=10/3 | single | 0.07x |
-| aes-gcm fec=10/3 | concurrent | 0.17x |
-| salsa20 fec=10/3 | single | 0.10x |
-| salsa20 fec=10/3 | concurrent | 0.18x |
+| none fec=0/0 | single | 0.94x |
+| none fec=0/0 | concurrent | 0.98x |
+| aes-gcm fec=10/3 | single | 0.31x |
+| aes-gcm fec=10/3 | concurrent | 0.54x |
+| salsa20 fec=10/3 | single | 0.70x |
+| salsa20 fec=10/3 | concurrent | 0.72x |
 
 ## Calibration (why the session numbers look the way they do)
 
 | measurement | value | meaning |
 | --- | --- | --- |
-| KCP state machine, no I/O (`bench/kcp_pump`) | 1196 MB/s | the protocol engine is not the limit (order of magnitude only: it swings with CPU frequency, 0.8-2.2 GB/s observed) |
-| one cross-thread UDP round trip (`bench/udp_pingpong`) | 100.0 us | what one OS wake-up costs (10001 round trips/s unbatched); the session layer beats this by draining a burst per wake |
-| one datagram send, `sendto()` (`bench/syscall_cost`) | 45.0 us wall | the call this port uses today; `sendto_deep_us` 42.2 us keeps a full receive queue, i.e. the cost is not queue-related |
-| the same datagram via `WSASendTo` | 2.6 us | 17.2x cheaper with a null OVERLAPPED (synchronous), so it is neither the async path nor the address argument; `connected_send_us` 2.5 us agrees |
-| one datagram receive, `recvfrom` | 1.1 us | the read path is two orders of magnitude below the send path, which is why the first P8 lever is on the send side |
-| readiness probe the drain loop pays per datagram | 0.73 us | `recv_empty_us` 0.28 us is what a non-blocking recvfrom costs instead, so replacing the probe is worth ~0.45 us per datagram |
-| AES-CFB, AES-NI (`bench/aes_bench`) | 1247 MB/s | 3.78x the T-table path (330 MB/s) |
-| AES-GCM, AES-NI (`bench/aes_bench`) | 166 MB/s | 1.37x the T-table path (122 MB/s) |
+| KCP state machine, no I/O (`bench/kcp_pump`) | 1200 MB/s | the protocol engine is not the limit (order of magnitude only: it swings with CPU frequency, 0.8-2.2 GB/s observed) |
+| one cross-thread UDP round trip (`bench/udp_pingpong`) | 17.9 us | what one OS wake-up costs (55866 round trips/s unbatched); the session layer beats this by draining a burst per wake |
+| one datagram send, `sendto()` (`bench/syscall_cost`) | 3.2 us wall | the call this port uses today; `sendto_deep_us` 2.9 us keeps a full receive queue, i.e. the cost is not queue-related |
+| the same datagram via `WSASendTo` | 2.6 us | 1.2x cheaper with a null OVERLAPPED (synchronous), so it is neither the async path nor the address argument; `connected_send_us` 2.5 us agrees |
+| one datagram receive, `recvfrom` | 0.9 us | the read path is two orders of magnitude below the send path, which is why the first P8 lever is on the send side |
+| readiness probe the drain loop pays per datagram | 0.74 us | `recv_empty_us` 0.28 us is what a non-blocking recvfrom costs instead, so replacing the probe is worth ~0.46 us per datagram |
+| AES-CFB, AES-NI (`bench/aes_bench`) | 1261 MB/s | 3.81x the T-table path (331 MB/s) |
+| AES-GCM, AES-NI (`bench/aes_bench`) | 168 MB/s | 1.37x the T-table path (123 MB/s) |

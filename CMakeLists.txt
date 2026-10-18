@@ -34,6 +34,7 @@ set(KCP_SOURCES
   src/internal/tea.cc
   src/internal/timedsched.cc
   src/platform/entropy_backend.cc
+  src/platform/profile.cc
   src/platform/socket.cc
   src/snmp.cc
 )

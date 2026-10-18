@@ -146,6 +146,10 @@ void UdpSession::Update() {
   if (closed_.load(std::memory_order_acquire)) {
     return;
   }
+  // TimedSched is one shared thread, so this session's share is charged per callback rather than
+  // by measuring the thread (P8.0). The flush that Update triggers on this session's behalf counts
+  // as this session's cost, which is exactly what the decomposition needs.
+  platform::CpuScope cpu(profiling_.load(std::memory_order_relaxed) ? &update_cpu_us_ : nullptr);
 
   std::chrono::steady_clock::time_point when;
   {
@@ -206,12 +210,17 @@ void UdpSession::OnKcpOutput(const std::uint8_t* buf, std::size_t size) {
 }
 
 void UdpSession::PostProcess() {
+  platform::SetThreadCounters(&io_);
   std::vector<std::vector<std::uint8_t>> txqueue;
   txqueue.reserve(kMaxBatchSize + 16);
   std::size_t bytes_to_send = 0;
   SendRequest request;
 
   while (post_processing_.Pop(&request)) {
+    // One scope per dequeued datagram. The pop itself blocks, but CPU time does not count a
+    // blocked thread, so what lands here is the pipeline work: FEC, CRC, encrypt, Tx (P8.0).
+    platform::CpuScope cpu(profiling_.load(std::memory_order_relaxed) ? &post_thread_cpu_us_
+                                                                      : nullptr);
     std::vector<internal::FecPacket> parity;
     if (fec_encoder_ != nullptr) {
       if (request.oob) {
@@ -296,8 +305,13 @@ void UdpSession::Tx(const std::vector<std::vector<std::uint8_t>>& packets) {
 // ---------------------------------------------------------------------------------------------
 
 void UdpSession::ReadLoop() {
+  platform::SetThreadCounters(&io_);
   std::vector<std::uint8_t> buffer(kMtuLimit);
   while (!closed_.load(std::memory_order_acquire)) {
+    // One scope per burst: the bounded wait inside is idle time and does not count as CPU, so this
+    // ends up being the receive pipeline itself - recvfrom, decrypt, CRC, FEC, Kcp::Input.
+    platform::CpuScope cpu(profiling_.load(std::memory_order_relaxed) ? &read_thread_cpu_us_
+                                                                      : nullptr);
     // Bounded wait instead of an unbounded recvfrom: shutdown() does not reliably wake a blocked
     // reader on POSIX and closing a descriptor under a blocked reader is undefined.
     const int ready = platform::SysWaitReadable(fd_, 50);
@@ -460,6 +474,11 @@ void UdpSession::KcpInput(std::uint8_t* data, std::size_t len) {
 // ---------------------------------------------------------------------------------------------
 
 int UdpSession::read(void* buf, std::size_t len, std::error_code* ec) {
+  const bool profiling = profiling_.load(std::memory_order_relaxed);
+  platform::CpuScope cpu(profiling ? &read_cpu_us_ : nullptr);
+  if (profiling) {
+    read_calls_.fetch_add(1, std::memory_order_relaxed);
+  }
   auto* out = static_cast<std::uint8_t*>(buf);
   std::unique_lock<std::mutex> lock(mu_);
 
@@ -523,6 +542,11 @@ int UdpSession::write(const void* data, std::size_t len, std::error_code* ec) {
 }
 
 int UdpSession::write_buffers(const std::vector<ConstBuffer>& bufs, std::error_code* ec) {
+  const bool profiling = profiling_.load(std::memory_order_relaxed);
+  platform::CpuScope cpu(profiling ? &write_cpu_us_ : nullptr);
+  if (profiling) {
+    write_calls_.fetch_add(1, std::memory_order_relaxed);
+  }
   int total = 0;
   std::unique_lock<std::mutex> lock(mu_);
 
@@ -725,6 +749,33 @@ void UdpSession::SetPacketTrace(PacketTrace trace) {
     return;
   }
   std::atomic_store(&packet_trace_, std::make_shared<const PacketTrace>(std::move(trace)));
+}
+
+void UdpSession::EnableProfiling() {
+  io_.enabled.store(true, std::memory_order_relaxed);
+  profiling_.store(true, std::memory_order_relaxed);
+}
+
+SessionProfile UdpSession::profile() const {
+  SessionProfile out;
+  out.read_thread_cpu_us = read_thread_cpu_us_.load(std::memory_order_relaxed);
+  out.post_thread_cpu_us = post_thread_cpu_us_.load(std::memory_order_relaxed);
+  out.update_cpu_us = update_cpu_us_.load(std::memory_order_relaxed);
+  out.write_cpu_us = write_cpu_us_.load(std::memory_order_relaxed);
+  out.write_calls = write_calls_.load(std::memory_order_relaxed);
+  out.read_cpu_us = read_cpu_us_.load(std::memory_order_relaxed);
+  out.read_calls = read_calls_.load(std::memory_order_relaxed);
+  out.tx_n = io_.send_n;
+  out.tx_us = io_.send_us;
+  out.tx_err = io_.send_err;
+  out.rx_n = io_.recv_n;
+  out.rx_us = io_.recv_us;
+  out.rx_err = io_.recv_err;
+  out.probe_n = io_.probe_n;
+  out.probe_us = io_.probe_us;
+  out.wait_n = io_.wait_n;
+  out.wait_us = io_.wait_us;
+  return out;
 }
 
 std::uint32_t UdpSession::conv() const {

@@ -78,6 +78,9 @@ struct Options {
   int stats_ms = 0;
   // Both: capture the first datagram that crosses the socket into this file (§6.1). Empty = off.
   std::string dump_packet;
+  // Client: enable the P8.0 per-session cost accounting and print the PROFILE line after RESULT.
+  // Off by default because it adds clock reads to the code being measured.
+  bool profile = false;
 };
 
 // Parses -name value / --name value / -name=value. Accepts both single and double dashes so the Go

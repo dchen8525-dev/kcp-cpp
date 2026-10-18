@@ -9,6 +9,8 @@
 
 #include <cstring>
 
+#include "kcp/platform/profile.h"
+
 #if defined(_WIN32)
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -283,6 +285,13 @@ int SysGetSockName(SocketHandle fd, SocketAddress* addr) {
 
 int SysSendTo(SocketHandle fd, const void* buf, std::size_t len, const SocketAddress& to) {
   NativeSocket sock = ToNative(fd);
+  // Profiling (PORTING-PLAN.md P8.0): priced from the caller's side, because that is where the
+  // cost is paid. Off unless a session installed counters for this thread.
+  IoCounters* counters = ThreadCounters();
+  if (counters != nullptr && !counters->enabled.load(std::memory_order_relaxed)) {
+    counters = nullptr;
+  }
+  const std::uint64_t start_us = counters != nullptr ? WallMicros() : 0;
 #if defined(_WIN32)
   const int sent =
       ::sendto(sock, static_cast<const char*>(buf), static_cast<int>(len), 0,
@@ -292,6 +301,13 @@ int SysSendTo(SocketHandle fd, const void* buf, std::size_t len, const SocketAdd
       ::sendto(sock, buf, len, 0, AsSockAddr(reinterpret_cast<const unsigned char*>(to.data())),
                static_cast<socklen_t>(to.size()));
 #endif
+  if (counters != nullptr) {
+    counters->send_us += WallMicros() - start_us;
+    ++counters->send_n;
+    if (sent < 0) {
+      ++counters->send_err;
+    }
+  }
   return static_cast<int>(sent);
 }
 
@@ -300,6 +316,11 @@ int SysRecvFrom(SocketHandle fd, void* buf, std::size_t len, SocketAddress* from
   // sockaddr_storage sized scratch buffer; never trust the caller's address family.
   unsigned char scratch[128];
   std::memset(scratch, 0, sizeof(scratch));
+  IoCounters* counters = ThreadCounters();
+  if (counters != nullptr && !counters->enabled.load(std::memory_order_relaxed)) {
+    counters = nullptr;
+  }
+  const std::uint64_t start_us = counters != nullptr ? WallMicros() : 0;
 #if defined(_WIN32)
   int scratch_len = static_cast<int>(sizeof(scratch));
   const int got = ::recvfrom(sock, static_cast<char*>(buf), static_cast<int>(len), 0,
@@ -308,6 +329,13 @@ int SysRecvFrom(SocketHandle fd, void* buf, std::size_t len, SocketAddress* from
   socklen_t scratch_len = sizeof(scratch);
   const ssize_t got = ::recvfrom(sock, buf, len, 0, AsSockAddr(scratch), &scratch_len);
 #endif
+  if (counters != nullptr) {
+    counters->recv_us += WallMicros() - start_us;
+    ++counters->recv_n;
+    if (got < 0) {
+      ++counters->recv_err;
+    }
+  }
   if (got >= 0 && from != nullptr) {
     if (scratch_len <= from->mutable_size()) {
       std::memcpy(from->mutable_data(), scratch, static_cast<std::size_t>(scratch_len));
@@ -396,11 +424,28 @@ int SysWaitReadable(SocketHandle fd, int timeout_ms) {
   timeval tv;
   tv.tv_sec = timeout_ms / 1000;
   tv.tv_usec = static_cast<long>(timeout_ms % 1000) * 1000;
+  // A zero timeout is the read loop's "is there another datagram queued" probe; a non-zero one is
+  // a real wait whose elapsed time is idle, not work. They are counted separately (P8.0).
+  IoCounters* counters = ThreadCounters();
+  if (counters != nullptr && !counters->enabled.load(std::memory_order_relaxed)) {
+    counters = nullptr;
+  }
+  const std::uint64_t start_us = counters != nullptr ? WallMicros() : 0;
 #if defined(_WIN32)
   const int rc = ::select(0, &read_set, nullptr, nullptr, &tv);
 #else
   const int rc = ::select(static_cast<int>(sock) + 1, &read_set, nullptr, nullptr, &tv);
 #endif
+  if (counters != nullptr) {
+    const std::uint64_t elapsed = WallMicros() - start_us;
+    if (timeout_ms == 0) {
+      counters->probe_us += elapsed;
+      ++counters->probe_n;
+    } else {
+      counters->wait_us += elapsed;
+      ++counters->wait_n;
+    }
+  }
   if (rc < 0) {
 #if !defined(_WIN32)
     // A signal is not an error: report a timeout so the caller re-checks its closed flag.
