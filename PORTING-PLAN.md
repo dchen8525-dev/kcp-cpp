@@ -1,6 +1,6 @@
-# kcp-cpp 移植计划 v5.6（参考 xtaci/kcp-go v5）
+# kcp-cpp 移植计划 v5.7（参考 xtaci/kcp-go v5）
 
-> 状态：**实施中**（v5.6，累计 20 轮对抗分析（75 条）+ 命名合规审计 + 源码逐行核验 + 用户决策；**P0 / P1 / P2 已完成**，见 §6）
+> 状态：**实施中**（v5.7，累计 20 轮对抗分析（75 条）+ 命名合规审计 + 源码逐行核验 + 用户决策；**P0 / P1 / P2 / P3 已完成**，见 §6）
 > 目标：将 D:\work\kcp-go（Go）完整移植为 C++17 库，输出到 D:\work\kcp-cpp，零第三方依赖。
 > 已确认决策：① 加密层自包含实现；② Reed-Solomon 自实现；③ 验收含跨语言互通；
 > ④ **定位 = 全量独立库**（含 session 层，与 kcp-proxy-cpp 解耦，集成另行议）；
@@ -114,6 +114,15 @@
 | 98 | **新增偏离 D9**：CFB 反馈寄存器用栈上数组，`BlockCrypt` 无可变状态 → `Encrypt/Decrypt` 为 `const`，**L1 锁取消**（§3.2 表同步） | 实施 |
 | 99 | 风险表补 R17/R18（GHASH 约定、XTEA 节奏），两者均为 P2 实际踩中的"静默错密文"级问题 | 实施 |
 
+### v5.6 → v5.7 修订摘要（P3 实施，非分析轮次）
+
+| 编号 | 修订 | 依据 |
+|---|---|---|
+| **100** | **P3 完成**：`internal/galois.{h,cc}`（0x11D 域、exp/log/64 KiB 乘法表）+ `internal/rs.{h,cc}`（系统性 Vandermonde、Gauss-Jordan 求逆、`Encode`/`ReconstructData`/`Reconstruct`）；`rs_test` 全绿 | 实施 |
+| 101 | **RS 构造对齐 `klauspost/reedsolomon@v1.12.0` 的默认路径**：`vm[r][c] = r^c`（r 为域元素）→ 取顶部 `d×d` 方阵求逆 → `vm × topInv`（reedsolomon.go:220-244）。`matrix_head` 逐字节命中 (3,1)/(10,3)/(20,10)/(128,128) 四组 | `rs.json` |
+| 102 | **`ReconstructData` 的 parity 语义显式化**：数据片齐全时它**不**补 parity（reedsolomon.go:1186 的 `dataOnly` 提前返回）；需补 parity 必须调 `Reconstruct`。P4 解码器只关心数据片，故用前者 | 实施 + 测试踩中 |
+| 103 | 风险表补 R19：RS 层**不做**补齐/清零，长度不齐一律 `kInvalidArgument`（#41 的落地形态）——若把这层职责下沉到 RS，P4 的 padding bug 会被静默吸收 | 实施 |
+
 ---
 
 ## 0.1 术语表（#65，消除"段/帧/包/shard/消息"混用）
@@ -157,9 +166,9 @@
 D:\work\kcp-cpp\
 ├── CMakeLists.txt / CMakePresets.json / .clang-format / build.bat / build.sh
 ├── PORTING-PLAN.md / LICENSE / README.md / .gitignore
-├── include/kcp/{kcp,fec,crypt,reedsolomon,udp_session,listener,snmp}.h
+├── include/kcp/{kcp,fec,crypt,udp_session,listener,snmp}.h
 ├── include/kcp/internal/{primitives,entropy,aes,gcm,salsa20,tea,cfb,bufferpool,
-│                        ringbuffer,blocking_queue,timedsched}.h
+│                        galois,rs,ringbuffer,blocking_queue,timedsched}.h
 ├── include/kcp/platform/{socket,entropy_backend}.h   # 决策⑤：WinSock2/POSIX 双实现
 ├── src/...                      # 与 include 同名 .cc，文件头注释含 MIT 出处
 ├── tests/                       # 集成测试串行执行；端口 = base + (pid % 1000)
@@ -381,6 +390,7 @@ std::shared_ptr<UdpSession> Listener::Accept(std::error_code* ec = nullptr);
 | D7 | session 生命周期 | GC + goroutine 自然退出 | `shared_ptr` + join | 资源管理是总原则的明确例外（§3.1） |
 | D8 | 行宽 | —（Go 用 gofmt，无 80 列硬限） | **100 列**（Google C++ Style 要求 80） | 密码学 T 表、hex 黄金向量、wire 布局注释在 80 列内不可读；`.clang-format: BasedOnStyle Google, ColumnLimit 100` |
 | D9 | CFB 工作缓冲 | 实例持有 `encbuf`/`decbuf` + `encMu`/`decMu`（crypt.go:130-158），`Encrypt/Decrypt` 需加锁 | 反馈寄存器用**栈上局部数组**，`BlockCrypt` 无共享可变状态 → `Encrypt/Decrypt` 声明为 `const`，L1 锁取消 | 每连接一个 crypt 实例，缓冲本就无跨线程复用价值；省掉两把锁与一次内存写。并发安全由"无可变状态"保证，强于加锁 |
+| D10 | RS 编解码器的可见性 | 无对应公开 API（`klauspost/reedsolomon.New` 是依赖，`fecEncoder/fecDecoder` 未导出） | `include/kcp/internal/rs.h`，**不建** `include/kcp/reedsolomon.h` | 与 Go 的可见性一致：RS 是 FEC 层的实现细节；对外只暴露 `FEC` 配置与 `SetFEC` |
 
 ### 3.5 全局对象与静态生命周期（#32/#33）
 
@@ -674,10 +684,25 @@ AES（**AES-NI intrinsics + cpuid 检测 + T 表回退**，决策⑥）→ GCM(G
 附带确认（此前未钉死的参数）：`NewTEABlockCrypt` 走 `tea.NewCipherWithRounds(key, 16)` —— **TEA 是 16 轮，不是 x/crypto 默认的 64 轮**（crypt.go:246）；Salsa20 的计数器**每次调用从 0 重启**（`salsa20.XORKeyStream` 每次重建 16B 输入块），因此 kcp-go 每包依赖随机 nonce 头去重，跨包不复用 keystream。
 
 
-### P3 Reed-Solomon（2d）
+### P3 Reed-Solomon（2d）—— ✅ 已完成
 GF(2⁸) 表 → 系统性 Vandermonde（Vandermonde → 顶部子阵求逆 → 左乘）→ Encode/ReconstructData。
 **接口契约（#41）**：`ReconstructData(shards)` **要求调用方传入等长分片**（缺失分片传空 buffer 占位）；补齐到 maxlen + 尾部清零由 **FEC 层（P4）**负责，不在 RS 内。
-**门**：前 data 行 = 单位阵；**`rs.json` parity 逐字节**（含变长组的补齐结果）；1000 轮随机擦除恢复全对（等长 + 变长各 500 轮）。
+**门**：
+- [x] 前 `data` 行 = 单位阵：(1,1)/(2,1)/(3,1)/(10,3)/(20,10)/(64,32)/(128,128) 七组逐一校验（`rs_test`）
+- [x] **`rs.json` parity 逐字节**：5 组（(3,1,128B)、(10,3,1KB)、(20,10,512B)、(128,128,64B)、(10,3,变长)），含 `matrix_head` 逐项对拍
+- [x] 1000 轮随机擦除恢复：等长 500 轮（`data ⊆ {3,10,20,33}` × `parity ⊆ {1,3,10}`，丢失 `1..parity` 片，`Reconstruct`/`ReconstructData` 各半）+ 变长 500 轮（先把 `1..maxlen` 的数据补零到 maxlen 再编解码）
+- [x] 契约负例：丢失 `parity+1` 片返回 `kFecRecoverFailed` 且**不分配**任何分片；片数/长度不齐返回 `kInvalidArgument`；`New` 拒绝 `d<1`/`p<0`/`d+p>256`
+- [x] `check_guard` 16 headers / `check_format` 42 files / `ctest` 10/10 全绿（Debug + Release）
+
+#### P3 实施记录（v5.7）
+
+| 项 | 计划 | 实际 | 原因 |
+|---|---|---|---|
+| 乘法实现 | 未指定 | 64 KiB 稠密 `mul[a][b]` 表（`MulTable()` 返回整表引用，数据路径每 shard 取一次指针），setup 路径走 `GaloisMul` 包装 | 与 `galois.go:851` 的 mulTable 同构；log/exp 每次乘要两次查表 + 条件减，在 128 片配置下差别可观 |
+| 矩阵求逆 | "顶部子阵求逆" | Gauss-Jordan on `[M \| I]`，内层用 `mul[factor][pivot[c]]` 单引用，128×128 约 4.2M 次查表 | 计划未限定算法；选带行主元交换的实现以覆盖奇异判定 |
+| 矩阵类型 | 未指定 | `.cc` 内匿名命名空间的 `Matrix`（稠密、行主序），不对外暴露 | 对外只需要 `MatrixAt(row,col)` 与三个编解码入口；暴露矩阵类会诱导调用方绕过 MDS 约束 |
+| 分片容器 | `shards` | `internal::ShardSet = std::vector<std::vector<std::uint8_t>>`，**空 vector = 缺失** | 与 Go 的 `nil` 语义同构，且不需要额外的 present 位图 |
+| 公开头 | `include/kcp/reedsolomon.h` | **不建**，改为 `include/kcp/internal/rs.h`（目录树已同步） | kcp-go 自身不导出 RS 编解码器（那是 `klauspost/reedsolomon` 的 `New`，属实现依赖）；`fecEncoder`/`fecDecoder` 同样未导出，公开的只有 `FEC` 配置结构与 `SetFEC` 路径 |
 
 ### P4 FEC 层（1.5d）
 fecEncoder/fecDecoder/shardHeap；autotune 仅挂点。
@@ -766,6 +791,7 @@ socket RAII（**platform/socket 双实现**，决策⑤）→ ringbuffer/`Blocki
 | R16 | **平台行为分叉**（双平台下 socket 选项/调度差异，决策⑤） | platform 抽象层收敛差异；P6 门禁双平台全量回归；§6.3 基线双平台各测 |
 | R17 | **GHASH 位序/归约常量搞反**（密文对、tag 错，P2 已实际踩中） | §6 P2 实施记录 #1 的判定方法（`S = tag ⊕ E(J0)` 反解 + big.Int 反序比对）；`gcm_test` 双向量 + `crypt.json` 两个 aesgcm 长度 |
 | R18 | **XTEA 表推进节奏错位**（每对轮多推进一次 sum，P2 已实际踩中） | §6 P2 实施记录 #2；`crypt.json` xtea 向量逐字节 |
+| R19 | **RS 层擅自吸收补齐职责**（对不等长分片做 padding/truncate，掩盖 P4 的 padding bug） | RS 对不等长一律 `kInvalidArgument`（`rs_test::TestEncodeRejectsBadShapes`）；补齐只在 P4 做，且 P4 门禁有 `fec.json` 逐字节对拍 |
 
 ---
 

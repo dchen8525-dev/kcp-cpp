@@ -19,8 +19,10 @@ set(KCP_SOURCES
   src/internal/aes.cc
   src/internal/bufferpool.cc
   src/internal/cfb.cc
+  src/internal/galois.cc
   src/internal/gcm.cc
   src/internal/primitives.cc
+  src/internal/rs.cc
   src/internal/salsa20.cc
   src/internal/tea.cc
   src/platform/entropy_backend.cc
