@@ -3,6 +3,9 @@
 /out/
 cmake-build-*/
 
+# Assistant / editor scratch data (kept on disk, not part of the library)
+.workbuddy/
+
 # IDE
 .vs/
 .vscode/
