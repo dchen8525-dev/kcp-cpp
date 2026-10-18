@@ -38,3 +38,7 @@ target_compile_definitions(crypt_test PRIVATE
 kcp_add_test(rs_test rs_test.cc json_reader.cc)
 target_compile_definitions(rs_test PRIVATE
   KCP_VECTOR_DIR="${CMAKE_SOURCE_DIR}/tools/golden/out")
+
+kcp_add_test(fec_test fec_test.cc json_reader.cc)
+target_compile_definitions(fec_test PRIVATE
+  KCP_VECTOR_DIR="${CMAKE_SOURCE_DIR}/tools/golden/out")

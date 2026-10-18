@@ -3,7 +3,7 @@
     "schema": 1,
     "go_version": "go1.27.2",
     "kcp_go_commit": "f3f1bbd9b9f2c18fde5882c19335ae31c131b077",
-    "generated_at": "2026-10-18T12:41:24Z",
+    "generated_at": "2026-10-18T13:12:59Z",
     "generator": "tools/golden/ref/golden_ref.go"
   },
   "vectors": [

@@ -205,6 +205,7 @@ void CheckFec() {
   bool saw_encode = false;
   bool saw_decode = false;
   bool saw_oob = false;
+  bool saw_varlen = false;
   for (const JsonValue& v : vectors->array_value) {
     std::string kind;
     CHECK(GetString(v, "kind", &kind));
@@ -224,6 +225,29 @@ void CheckFec() {
             static_cast<long long>(parity->size()) == parity_shards);
       const JsonValue* packets = Find(v, "packets_hex");
       CHECK(packets != nullptr && packets->IsArray() && packets->size() > 0);
+    } else if (kind == "encode-varlen") {
+      saw_varlen = true;
+      long long expect = 0;
+      CHECK(GetInt(v, "expect_parity_count", &expect));
+      CHECK_MSG(expect == parity_shards, "fec.json encode-varlen: expect_parity_count mismatch");
+      const JsonValue* parity = Find(v, "parity_hex");
+      CHECK(parity != nullptr && parity->IsArray() &&
+            static_cast<long long>(parity->size()) == parity_shards);
+      const JsonValue* packets = Find(v, "packets_hex");
+      CHECK(packets != nullptr && packets->IsArray() &&
+            static_cast<long long>(packets->size()) > 1);
+      if (packets != nullptr && packets->IsArray()) {
+        // The whole point of this vector is unequal shard lengths; equal ones would silently
+        // stop covering the zero-extension path.
+        const std::size_t first = HexToBytes(packets->array_value[0].string_value).size();
+        bool differs = false;
+        for (const JsonValue& item : packets->array_value) {
+          if (HexToBytes(item.string_value).size() != first) {
+            differs = true;
+          }
+        }
+        CHECK_MSG(differs, "fec.json encode-varlen: shard lengths are all equal");
+      }
     } else if (kind == "decode") {
       saw_decode = true;
       const JsonValue* dropped = Find(v, "dropped");
@@ -244,6 +268,7 @@ void CheckFec() {
   CHECK(saw_encode);
   CHECK(saw_decode);
   CHECK(saw_oob);
+  CHECK(saw_varlen);
 }
 
 void CheckKcp() {

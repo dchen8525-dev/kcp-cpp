@@ -476,6 +476,40 @@ func buildFecVectors(t *testing.T) []fecVector {
 		}
 	}
 
+	// Second round on the *same* encoder, with a different payload length per shard. Every shard
+	// cache still holds the 206-byte packet of the first round, so the encoder has to zero-extend
+	// each shorter shard up to the set maximum before computing parity (fec.go:437). Without that
+	// zeroing the parity would be computed over stale bytes - a defect that a uniform-length
+	// vector cannot see, which is exactly why this vector exists.
+	var varPackets [][]byte
+	var varParity [][]byte
+	varLens := make([]int, goldenFecDataShards)
+	for i := 0; i < goldenFecDataShards; i++ {
+		n := payloadLen - i*13
+		varLens[i] = n
+		buf := make([]byte, fecHeaderSize+n)
+		copy(buf[fecHeaderSize:], goldenPattern(n, byte(0x40+i)))
+		ps := enc.encode(buf, goldenFecLatencyMs)
+		varPackets = append(varPackets, goldenClone(buf))
+		if i == goldenFecDataShards-1 {
+			varParity = goldenCloneAll(ps)
+		}
+	}
+	if len(varParity) != goldenFecParityShards {
+		t.Fatalf("varlen: expected %d parity shards, got %d", goldenFecParityShards, len(varParity))
+	}
+	for i := 1; i < len(varLens); i++ {
+		if varLens[i] == varLens[0] {
+			t.Fatalf("varlen: shard %d has the same payload length as shard 0", i)
+		}
+	}
+	// The seqid space continues from the first round, so this set is shard id 1 (13..25).
+	for i, pkt := range varPackets {
+		if got := binary.LittleEndian.Uint32(pkt[0:4]); got != uint32(goldenFecDataShards+goldenFecParityShards+i) {
+			t.Fatalf("varlen packet %d: seqid = %d", i, got)
+		}
+	}
+
 	// OOB frame: 6-byte FEC header (seqid 0xffffffff, typeOOB) + 2-byte size + conv(4) + payload.
 	oobEnc := newFECEncoder(goldenFecDataShards, goldenFecParityShards, 0)
 	conv := []byte{0x01, 0x00, 0x00, 0x00}
@@ -511,6 +545,16 @@ func buildFecVectors(t *testing.T) []fecVector {
 			PacketsHex:      goldenHexAll(all),
 			Dropped:         dropped,
 			RecoveredHex:    goldenHexAll(recovered),
+		},
+		{
+			Kind:              "encode-varlen",
+			DataShards:        goldenFecDataShards,
+			ParityShards:      goldenFecParityShards,
+			HeaderOffset:      0,
+			EncodeLatencyMs:   goldenFecLatencyMs,
+			PacketsHex:        goldenHexAll(varPackets),
+			ParityHex:         goldenHexAll(varParity),
+			ExpectParityCount: len(varParity),
 		},
 		{
 			Kind:         "oob",

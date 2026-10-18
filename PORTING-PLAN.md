@@ -1,6 +1,6 @@
-# kcp-cpp 移植计划 v5.7（参考 xtaci/kcp-go v5）
+# kcp-cpp 移植计划 v5.8（参考 xtaci/kcp-go v5）
 
-> 状态：**实施中**（v5.7，累计 20 轮对抗分析（75 条）+ 命名合规审计 + 源码逐行核验 + 用户决策；**P0 / P1 / P2 / P3 已完成**，见 §6）
+> 状态：**实施中**（v5.8，累计 20 轮对抗分析（75 条）+ 命名合规审计 + 源码逐行核验 + 用户决策；**P0 / P1 / P2 / P3 / P4 已完成**，见 §6）
 > 目标：将 D:\work\kcp-go（Go）完整移植为 C++17 库，输出到 D:\work\kcp-cpp，零第三方依赖。
 > 已确认决策：① 加密层自包含实现；② Reed-Solomon 自实现；③ 验收含跨语言互通；
 > ④ **定位 = 全量独立库**（含 session 层，与 kcp-proxy-cpp 解耦，集成另行议）；
@@ -24,7 +24,7 @@
 | 11 | 39 | **写死 `writeDelay` 默认 false**（Go 零值）→ 默认 Write 立即 `flush(FULL)`；`SetWriteDelay(true)` 才开聚合 | sess.go:143,417,525 |
 | 11 | 40 | **撤回 v3 #3"AEAD MTU quirk"误判**：`SetMtu` 有双重减头 `min(mtuLimit,mtu) - headerSize - aead.Overhead()`，构造路径同样走（sess.go:248）→ 包不超限。改写为 §3.7 SetMtu 契约 | sess.go:248,537-547 |
 | 12 | 41 | **RS 补齐契约**：解码前全部 shard 补齐到 maxlen + **尾部清零**，仅缺失的数据分片（k<dataShards）分配空 buffer。P3 接口改为"调用方保证等长"，P4 负责补齐；P3 测试增变长场景 | fec.go:278-290 |
-| 12 | 42 | recovered 缓冲**所有权转移**：成功归调用者、失败自回收。C++ 用 `vector<unique_ptr<Buffer>>` | fec.go:293-307 |
+| 12 | 42 | recovered 缓冲**所有权转移**：成功归调用者、失败自回收。C++ 用 `vector<unique_ptr<Buffer>>`（P4 改为 owning `FecPacket`，见 D11） | fec.go:293-307 |
 | 13 | 43 | **CFB 残字节纯 XOR 语义**：尾部不足一块只 XOR、不更新反馈寄存器、不再次加密；encrypt16 的宽切片 `dst[base:]` 是 Go slice 写法，等价 16B 块推进，直译必错 | crypt.go:421,466-501 |
 | 13 | 44 | **BlockCrypt 接口分裂**：AEAD 的 `Encrypt/Decrypt` 是 panic 空操作，统一虚接口假设错误 → 拆 `BlockCrypt`(CFB) + `AeadCrypt`(Seal/Open) 双接口（v5.4 去 `I` 前缀） | crypt.go:74-80 |
 | 13 | 45 | 常量值钉死：`initialVector` / `saltxor` 具体字节 | crypt.go:50-51 |
@@ -123,6 +123,17 @@
 | 102 | **`ReconstructData` 的 parity 语义显式化**：数据片齐全时它**不**补 parity（reedsolomon.go:1186 的 `dataOnly` 提前返回）；需补 parity 必须调 `Reconstruct`。P4 解码器只关心数据片，故用前者 | 实施 + 测试踩中 |
 | 103 | 风险表补 R19：RS 层**不做**补齐/清零，长度不齐一律 `kInvalidArgument`（#41 的落地形态）——若把这层职责下沉到 RS，P4 的 padding bug 会被静默吸收 | 实施 |
 
+### v5.7 → v5.8 修订摘要（P4 实施，非分析轮次）
+
+| 编号 | 修订 | 依据 |
+|---|---|---|
+| **104** | **P4 完成**：`internal/fec.{h,cc}`（FecEncoder / FecDecoder / ShardHeap）+ `internal/byteorder.h`（LE 读写与 `TimeDiff`）；`fec_test` 全绿 | 实施 |
+| 105 | **`fec.json` 新增 `encode-varlen` 向量**：同一 encoder 的**第二轮**，10 个 shard 载荷 200/187/…/83 字节 | 等长向量下 `maxSize − len == 0`，尾补零规则零覆盖；漏清零的变异测试此前是越界崩溃而非断言失败（§6 P4 实施记录末行） |
+| 106 | **FEC 长度字段含自身 2 字节**（`size = len(buf) − payloadOffset`，fec.go:406），注释里的 `PAYLOAD(SIZE-2)` 易误读 | 源码核验 |
+| 107 | **新增偏离 D11**：`FecPacket` 为 owning vector，恢复分片直接 move 移交，取消 #42 的池化所有权协议 | 实施（RAII 消除一整类泄漏路径） |
+| 108 | **autotune 从“仅挂点”降为“不实现”**：P4 不存在 `shouldTune` 分支 | Go 该分支会 `return nil` 丢包；参数变更（含 sampler）统一放 P8，否则验证不了重调后的恢复链 |
+| 109 | 风险表补 R20（RS owning 接口多一跳 memcpy，视图化以 P6/P7 实测为触发条件） | 实施 |
+
 ---
 
 ## 0.1 术语表（#65，消除"段/帧/包/shard/消息"混用）
@@ -145,7 +156,7 @@
 | kcp.go | 1147 | kcp.h / kcp.cc | 高 |
 | sess.go | 1534 | udp_session.h / udp_session.cc（+ listener.h/.cc） | 高 |
 | crypt.go | 696 | crypt.h + internal/{aes,gcm,salsa20,tea,cfb} | 高 |
-| fec.go | 512 | fec.h / fec.cc | 中 |
+| fec.go | 512 | internal/fec.h / internal/fec.cc | 中 |
 | ringbuffer.go | 244 | internal/ringbuffer.h | 中 |
 | snmp.go | 216 | snmp.h / snmp.cc | 低 |
 | timedsched.go | 184 | internal/timedsched.h/.cc | 中 |
@@ -166,9 +177,9 @@
 D:\work\kcp-cpp\
 ├── CMakeLists.txt / CMakePresets.json / .clang-format / build.bat / build.sh
 ├── PORTING-PLAN.md / LICENSE / README.md / .gitignore
-├── include/kcp/{kcp,fec,crypt,udp_session,listener,snmp}.h
-├── include/kcp/internal/{primitives,entropy,aes,gcm,salsa20,tea,cfb,bufferpool,
-│                        galois,rs,ringbuffer,blocking_queue,timedsched}.h
+├── include/kcp/{kcp,crypt,udp_session,listener,snmp}.h
+├── include/kcp/internal/{primitives,entropy,byteorder,aes,gcm,salsa20,tea,cfb,bufferpool,
+│                        galois,rs,fec,ringbuffer,blocking_queue,timedsched}.h
 ├── include/kcp/platform/{socket,entropy_backend}.h   # 决策⑤：WinSock2/POSIX 双实现
 ├── src/...                      # 与 include 同名 .cc，文件头注释含 MIT 出处
 ├── tests/                       # 集成测试串行执行；端口 = base + (pid % 1000)
@@ -391,6 +402,7 @@ std::shared_ptr<UdpSession> Listener::Accept(std::error_code* ec = nullptr);
 | D8 | 行宽 | —（Go 用 gofmt，无 80 列硬限） | **100 列**（Google C++ Style 要求 80） | 密码学 T 表、hex 黄金向量、wire 布局注释在 80 列内不可读；`.clang-format: BasedOnStyle Google, ColumnLimit 100` |
 | D9 | CFB 工作缓冲 | 实例持有 `encbuf`/`decbuf` + `encMu`/`decMu`（crypt.go:130-158），`Encrypt/Decrypt` 需加锁 | 反馈寄存器用**栈上局部数组**，`BlockCrypt` 无共享可变状态 → `Encrypt/Decrypt` 声明为 `const`，L1 锁取消 | 每连接一个 crypt 实例，缓冲本就无跨线程复用价值；省掉两把锁与一次内存写。并发安全由"无可变状态"保证，强于加锁 |
 | D10 | RS 编解码器的可见性 | 无对应公开 API（`klauspost/reedsolomon.New` 是依赖，`fecEncoder/fecDecoder` 未导出） | `include/kcp/internal/rs.h`，**不建** `include/kcp/reedsolomon.h` | 与 Go 的可见性一致：RS 是 FEC 层的实现细节；对外只暴露 `FEC` 配置与 `SetFEC` |
+| D11 | FEC 分片缓冲的所有权 | #42 设计：池化 buffer，恢复成功移交调用者、失败自回收 | `FecPacket` = owning `std::vector`；恢复出的分片直接 move 给调用者，失败时随栈销毁 | 偏离的是「协议」而非行为：RAII 让移交/回收这组约定不存在，少一类泄漏与二次释放路径。池只用于 P6 的收发缓冲 |
 
 ### 3.5 全局对象与静态生命周期（#32/#33）
 
@@ -582,7 +594,7 @@ dst[tail] = src[tail] XOR tbl                 // 纯 XOR：不进 tbl、不再�
 |---|---|---|
 | `crypt.json` | 7 算法 × 固定 key/输入缓冲的密文，**含非块对齐长度**（#43） | 逐字节 |
 | `rs.json` | (3,1)(10,3)(20,10)(128,128) 的 parity + 擦除恢复 + 矩阵前 4 行；**每组含一组变长分片**（#41 补齐契约） | 逐字节 |
-| `fec.json` | 编码帧、丢 N 片恢复、OOB 帧 | 逐字节；生成器**断言 parity 帧数 == parityShards**，否则重试（确定性依据是常量 `maxFECEncodeLatency=500`，sess.go:91,698） |
+| `fec.json`   | 编码帧、**变长 shard set**（第二轮，缓存里残留上一轮的更长包）、丢 N 片恢复、OOB 帧 | 逐字节；生成器**断言 parity 帧数 == parityShards**，否则重试（确定性依据是常量 `maxFECEncodeLatency=500`，sess.go:91,698） |
 | `kcp.json` | Send+flush 输出段（消息模式 & 流模式） | **ts 字段（段内偏移 8..11）掩码置零后逐字节**；另断言 ts 与本机时钟差 <5s；params 按 §4.6 固定 |
 | `frame.json` | 给定 KCP 段 → 加密后字节（6 种配置） | 逐字节；CFB/GCM 用**固定 nonce**（session 管线里 nonce 随机，故向量只锁"给定 nonce 下的密文"，组装由 C++ 侧自建 buffer 复算） |
 
@@ -605,7 +617,9 @@ dst[tail] = src[tail] XOR tbl                 // 纯 XOR：不进 tbl、不再�
              "var_len":true,"max_len":1024,"shard_lens":[1024,700,...]}]}
 
 // fec.json
-{"vectors":[{"kind":"encode|decode|oob",
+// kind=encode-varlen 是同一个 encoder 的第二轮，各 shard 载荷长度不同：只有这条能暴露
+// "补齐到 maxlen 前没清零"的缺陷（首轮缓存全零，不清零也能过）。
+{"vectors":[{"kind":"encode|encode-varlen|decode|oob",
              "data_shards":10,"parity_shards":3,"header_offset":0,"encode_latency_ms":500,
              "packets_hex":[".."],"parity_hex":[".."],"expect_parity_count":3,
              "dropped":[0,5],"recovered_hex":[".."],"packet_hex":".."}]}
@@ -704,11 +718,30 @@ GF(2⁸) 表 → 系统性 Vandermonde（Vandermonde → 顶部子阵求逆 → 
 | 分片容器 | `shards` | `internal::ShardSet = std::vector<std::vector<std::uint8_t>>`，**空 vector = 缺失** | 与 Go 的 `nil` 语义同构，且不需要额外的 present 位图 |
 | 公开头 | `include/kcp/reedsolomon.h` | **不建**，改为 `include/kcp/internal/rs.h`（目录树已同步） | kcp-go 自身不导出 RS 编解码器（那是 `klauspost/reedsolomon` 的 `New`，属实现依赖）；`fecEncoder`/`fecDecoder` 同样未导出，公开的只有 `FEC` 配置结构与 `SetFEC` 路径 |
 
-### P4 FEC 层（1.5d）
-fecEncoder/fecDecoder/shardHeap；autotune 仅挂点。
-**补齐落地（#41/#42）**：decode 中把已收 shard `[:maxlen]` + 尾部清零；仅 `k < dataShards` 的缺失位分配空 buffer；恢复成功 → recovered 缓冲所有权移交调用者，失败 → 自回收（§3.4 计 FECErrs）。
-**约束**：`shouldTune` 缺省恒 false，包正常入 shardHeap，**严禁实现为 return nil 丢包**（Go 那个分支是真丢包）。
-**门**：`fec.json` 全项逐字节；移植 fec_test（丢 1..N 片、OOB）；断言 FEC 关闭时解码器为 nullptr 且裸 KCP 路径不受影响；**snmp 断言**：`fec_full_shard_set`/`fec_recovered`/`fec_errs` 计数与场景期望一致（#51）。
+### P4 FEC 层（1.5d）—— ✅ 已完成
+
+fecEncoder/fecDecoder/shardHeap；autotune 仅挂点。  
+**补齐落地（#41/#42）**：decode 中把已收 shard `[:maxlen]` + 尾部清零；仅 `k < dataShards` 的缺失位分配空 buffer；恢复成功 → recovered 缓冲所有权移交调用者，失败 → 自回收（§3.4 计 FECErrs）。  
+**约束**：`shouldTune` 缺省恒 false，包正常入 shardHeap，**严禁实现为 return nil 丢包**（Go 那个分支是真丢包）。  
+**门**：
+- [x] **`fec.json` 全项逐字节**：`encode`（10 数据帧 + 3 parity，含 FEC 头与 2B 长度字段）、`encode-varlen`（同一 encoder 第二轮，各 shard 长度 206→89 不等）、`decode`（丢 shard 0/4 后恢复 2 片）、`oob`（74B 帧，seqid 0xffffffff + typeOob）
+- [x] 移植 fec_test：**全部可恢复丢失组合**（13 包丢 1~3 片的 286 种组合全跑，逐片比对被丢包的 payload）+ OOB + 重复包/超 paws/短包三条负例
+- [x] **FEC 关闭 = 解码器为 nullptr**：`FecDecoder::New(0,0)`、`New(0,3)`、`New(10,-1)`、`New(200,100)` 均返回 nullptr；`128+128` 可建
+- [x] **snmp 断言**：丢 2 片场景 → `fec_recovered=2`、`fec_parity_shards=3`、`fec_full_shard_set=0`、`fec_errs=0`、`fec_shard_set=1`（gauge）、`fec_shard_min=0`；无丢包场景 → `fec_full_shard_set=1` 且 `fec_recovered=0`
+- [x] **连续性窗口**：`rto=0` 时 10 个数据包不产出 parity，但 seqid 仍推进到 13（下一个数据包落在 parity 槽位，接收端靠这个空档判丢）；`rto=500` 时正常产出
+- [x] **陈旧 shard set 回收**：喂 6 个 set 各 1 包后只剩 4 个（set 0/1 被 `maxShardSets=3` 规则丢弃）
+- [x] `check_guard` 18 headers / `check_format` 46 files / `ctest` 11/11 全绿（Debug + Release）
+
+#### P4 实施记录（v5.8）
+
+| 项 | 计划 | 实际 | 原因 |
+|---|---|---|---|
+| autotune | “仅挂点” | **完全不实现**：无 `shouldTune` 分支、无 sampler | Go 那段在检测到类型不匹配时 `return nil`（fec.go:279-320），是真丢包；P4 只保证“包一定进 shardHeap”。参数变更场景要连同 sampler 一起在 P8 做，届时才验证得了重调后的恢复链 |
+| 长度字段语义 | — | `size = len(buf) − payloadOffset`，**含自身 2 字节**（fec.go:406） | 注释写的是 `PAYLOAD(SIZE-2)`，容易误读成“不含自身”；按“不含自身”写会让每包少 2B，FEC 头之后的整条偏移链全错 |
+| 解码器缓冲 | 池 + 所有权移交 | `FecPacket` = `std::vector<std::uint8_t>`，恢复出的分片**本身即 owning vector**，直接 move 给调用者；失败时随栈对象销毁 | 偏离 **D11**：RAII 让“成功移交 / 失败自回收”这组协议不存在，少一类泄漏路径；池只留给 P6 的收发缓冲 |
+| RS 调用 | — | 编码侧把 `[payloadOffset, maxSize)` 拷进成员 `ShardSet`（复用，不反复分配）；解码侧把每片 `pkt[6:]` 拷进 `shards_` | 见 R20：RS 是 owning `ShardSet` 接口，视图化要等 P6/P7 实测（Go 用 alias 省掉这一跳）。当前每包多一跳 ~1.4KB memcpy |
+| 时间基准 | — | `steady_clock` 毫秒，而非 `time.Now().UnixMilli()` | 唯一用途是两次数据包的间隔比较；墙钟跳变会把“突发”误判为“非连续”（少发 parity）或反之 |
+| **黄金向量缺口（本轮补上）** | `fec.json` 只有等长场景 | 新增 `encode-varlen`：同一 encoder 的**第二轮**，10 个 shard 载荷 200/187/…/83 字节 | 等长向量里 `maxSize − len == 0`，**尾部补零规则一次都没被走到**：变异测试（删掉 memset）不是断言失败而是直接越界崩溃，说明该路径无数据对拍。补向量后同一变异由 `varlen parity packet 0/1/2 mismatch` 精确捕获 |
 
 ### P5 KCP 核心（3.5d）
 kcp.go 逐函数移植（含 §4.6 全部默认值、§4.8 dead_link）。
@@ -792,6 +825,7 @@ socket RAII（**platform/socket 双实现**，决策⑤）→ ringbuffer/`Blocki
 | R17 | **GHASH 位序/归约常量搞反**（密文对、tag 错，P2 已实际踩中） | §6 P2 实施记录 #1 的判定方法（`S = tag ⊕ E(J0)` 反解 + big.Int 反序比对）；`gcm_test` 双向量 + `crypt.json` 两个 aesgcm 长度 |
 | R18 | **XTEA 表推进节奏错位**（每对轮多推进一次 sum，P2 已实际踩中） | §6 P2 实施记录 #2；`crypt.json` xtea 向量逐字节 |
 | R19 | **RS 层擅自吸收补齐职责**（对不等长分片做 padding/truncate，掩盖 P4 的 padding bug） | RS 对不等长一律 `kInvalidArgument`（`rs_test::TestEncodeRejectsBadShapes`）；补齐只在 P4 做，且 P4 门禁有 `fec.json` 逐字节对拍 |
+| R20 | RS 的 owning `ShardSet` 接口让 FEC 每包多一跳 ~1.4KB memcpy（Go 用 alias 免掉这一跳） | 先实测：P6/P7 吞吐若低于 Go 基线 30%，再给 RS 加 `EncodeView` / `ReconstructView`（视图 + 调用方预分配）；现在动手属未测先改 |
 
 ---
 
