@@ -1169,6 +1169,8 @@ socket RAII（**platform/socket 双实现**，决策⑤）→ ringbuffer/`Blocki
 | R21 | **flush 首帧空转被"顺手修好"**（`cwnd` 初值 0 时首帧不发段，看起来像 bug）                   | `TestCwndBootstrap` 钉住；`kcp.json` 首帧向量在 nc=1 下不受 cwnd 影响，两条路径都要保留                                       |
 | R22 | **"永不返回"的循环被加上了 return**（读循环 / `Close` 递归关闭子节点这两类 Go 形态，加了 `return` 就变成整机停摆或堆损坏） | P6 两处实际踩中：`Monitor` 遇 `WSAECONNRESET` 退出 → 同 listener 全部会话饿死；`Listener::close` 不关子会话 → 会话析构回调已释放的 map（`STATUS_HEAP_CORRUPTION`）。缓解：①照抄 Go 的错误策略（recv 错误只计数）②`Listener.Close` 必须先关全部子会话再关 fd ③判定只能用**共享资源并发形态**（1 listener + N 会话）压测，单连形态永远测不出（实测 160 次单连全绿而并发 15/40 失败）④`TestListenerSurvivesPeerDisappearing` + `TestListenerCloseClosesSessions` 钉住，两处均做过变异回退验证 |
 | R23 | **per-call 系统调用成本随 API 变化一个数量级**（`sendto` 44 µs vs `WSASendTo` 2.6 µs，仅 Windows；Linux 上 `sendto` 本就是 1~2 µs 量级） | `bench/syscall_cost` 把每个调用单独定价（墙钟 + CPU 双时钟），`run_bench.py` 每次基线都重跑它，数字不会过期；P8 每一项都以它做前后对照。**教训**：先给每个系统调用定价，再讨论算法/协议/加密，否则会把 I/O 成本误记到协议头上 |
+| R24 | **profile 计数器非原子**（P8.0 仪器化引入：I/O 线程在 `SysSendTo`/`SysRecvFrom`/`SysWaitReadable` 裸写 `IoCounters`，用户线程 `profile()` 裸读；现状靠"close() 后读"的文档契约 + join 的 happens-before 缓解，但 API 不强制，中途读即数据竞争） | 10 个字段全部改 `std::atomic<uint64_t>`（relaxed）：写侧 `fetch_add`、读侧 `load`；每数据报多一次 locked RMW，相对 2.6 µs 的 `WSASendTo` 是噪声。`TestProfilingCountersDoNotBreakTransfer` 钉住自洽性（`probe_n ∈ [rx_n-2, rx_n]`） |
+| R25 | **`write_buffers` 批次字节数 int 溢出**（单批 >2 GB：`total += static_cast<int>(view.len)` 有符号溢出（UB），回绕负值冒充成功字节数；上游 Go 的 int 为 64 位会接受该批次） | 批次总量以 `size_t` 预累加 + 预检，超 INT_MAX 一律 `kInvalidArgument`：不入队、不持锁、会话保持可用（>2 GB 的 KCP 报文在 UDP 上本不可达，确定化拒绝是安全移植）。`TestWriteBuffersRejectsOversizedBatch` 用 `nullptr` + `INT_MAX+1` 长度做零分配回归，并验证拒绝后普通写入仍可达对端 |
 
 ---
 

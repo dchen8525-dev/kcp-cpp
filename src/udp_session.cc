@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -547,7 +548,19 @@ int UdpSession::write_buffers(const std::vector<ConstBuffer>& bufs, std::error_c
   if (profiling) {
     write_calls_.fetch_add(1, std::memory_order_relaxed);
   }
-  int total = 0;
+  // The return type is int, so a batch larger than INT_MAX can never be reported back to the
+  // caller. Refuse it up front instead of summing into an int: signed overflow is UB, and the
+  // wrapped-negative total would masquerade as a successful byte count (upstream kcp-go writes
+  // with a 64-bit int and would accept the batch, but no KCP message of that size is deliverable
+  // over UDP anyway, so the deterministic refusal is the safe port). The check touches lengths
+  // only - no buffer is dereferenced - so nothing is queued and the session stays usable.
+  std::size_t total = 0;
+  for (const auto& view : bufs) {
+    total += view.len;
+    if (total > static_cast<std::size_t>((std::numeric_limits<int>::max)())) {
+      return Fail(ec, ErrorCode::kInvalidArgument);
+    }
+  }
   std::unique_lock<std::mutex> lock(mu_);
 
   for (;;) {
@@ -562,8 +575,8 @@ int UdpSession::write_buffers(const std::vector<ConstBuffer>& bufs, std::error_c
     // (sess.go:390-425).
     if (kcp_->wait_snd() < static_cast<int>(kcp_->snd_wnd())) {
       const std::size_t mss = kcp_->mss();
+      // `total` was summed (and range-checked) before the lock; the send loop only consumes.
       for (const auto& view : bufs) {
-        total += static_cast<int>(view.len);
         const auto* cursor = static_cast<const std::uint8_t*>(view.data);
         std::size_t left = view.len;
         while (left > 0) {
@@ -581,7 +594,7 @@ int UdpSession::write_buffers(const std::vector<ConstBuffer>& bufs, std::error_c
       }
       Bump(DefaultSnmp().bytes_sent, static_cast<std::uint64_t>(total));
       Succeed(ec);
-      return total;
+      return static_cast<int>(total);
     }
 
     if (Expired(write_deadline_)) {
@@ -765,16 +778,16 @@ SessionProfile UdpSession::profile() const {
   out.write_calls = write_calls_.load(std::memory_order_relaxed);
   out.read_cpu_us = read_cpu_us_.load(std::memory_order_relaxed);
   out.read_calls = read_calls_.load(std::memory_order_relaxed);
-  out.tx_n = io_.send_n;
-  out.tx_us = io_.send_us;
-  out.tx_err = io_.send_err;
-  out.rx_n = io_.recv_n;
-  out.rx_us = io_.recv_us;
-  out.rx_err = io_.recv_err;
-  out.probe_n = io_.probe_n;
-  out.probe_us = io_.probe_us;
-  out.wait_n = io_.wait_n;
-  out.wait_us = io_.wait_us;
+  out.tx_n = io_.send_n.load(std::memory_order_relaxed);
+  out.tx_us = io_.send_us.load(std::memory_order_relaxed);
+  out.tx_err = io_.send_err.load(std::memory_order_relaxed);
+  out.rx_n = io_.recv_n.load(std::memory_order_relaxed);
+  out.rx_us = io_.recv_us.load(std::memory_order_relaxed);
+  out.rx_err = io_.recv_err.load(std::memory_order_relaxed);
+  out.probe_n = io_.probe_n.load(std::memory_order_relaxed);
+  out.probe_us = io_.probe_us.load(std::memory_order_relaxed);
+  out.wait_n = io_.wait_n.load(std::memory_order_relaxed);
+  out.wait_us = io_.wait_us.load(std::memory_order_relaxed);
   return out;
 }
 

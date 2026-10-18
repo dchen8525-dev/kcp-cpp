@@ -302,10 +302,10 @@ int SysSendTo(SocketHandle fd, const void* buf, std::size_t len, const SocketAdd
                static_cast<socklen_t>(to.size()));
 #endif
   if (counters != nullptr) {
-    counters->send_us += WallMicros() - start_us;
-    ++counters->send_n;
+    counters->send_us.fetch_add(WallMicros() - start_us, std::memory_order_relaxed);
+    counters->send_n.fetch_add(1, std::memory_order_relaxed);
     if (sent < 0) {
-      ++counters->send_err;
+      counters->send_err.fetch_add(1, std::memory_order_relaxed);
     }
   }
   return static_cast<int>(sent);
@@ -330,10 +330,10 @@ int SysRecvFrom(SocketHandle fd, void* buf, std::size_t len, SocketAddress* from
   const ssize_t got = ::recvfrom(sock, buf, len, 0, AsSockAddr(scratch), &scratch_len);
 #endif
   if (counters != nullptr) {
-    counters->recv_us += WallMicros() - start_us;
-    ++counters->recv_n;
+    counters->recv_us.fetch_add(WallMicros() - start_us, std::memory_order_relaxed);
+    counters->recv_n.fetch_add(1, std::memory_order_relaxed);
     if (got < 0) {
-      ++counters->recv_err;
+      counters->recv_err.fetch_add(1, std::memory_order_relaxed);
     }
   }
   if (got >= 0 && from != nullptr) {
@@ -439,11 +439,11 @@ int SysWaitReadable(SocketHandle fd, int timeout_ms) {
   if (counters != nullptr) {
     const std::uint64_t elapsed = WallMicros() - start_us;
     if (timeout_ms == 0) {
-      counters->probe_us += elapsed;
-      ++counters->probe_n;
+      counters->probe_us.fetch_add(elapsed, std::memory_order_relaxed);
+      counters->probe_n.fetch_add(1, std::memory_order_relaxed);
     } else {
-      counters->wait_us += elapsed;
-      ++counters->wait_n;
+      counters->wait_us.fetch_add(elapsed, std::memory_order_relaxed);
+      counters->wait_n.fetch_add(1, std::memory_order_relaxed);
     }
   }
   if (rc < 0) {

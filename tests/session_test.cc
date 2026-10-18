@@ -12,6 +12,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -793,6 +794,42 @@ void TestProfilingCountersDoNotBreakTransfer() {
   }
 }
 
+// Regression guard for the R4 adversarial review: write_buffers() used to sum buffer lengths into
+// an int, so a batch over INT_MAX bytes overflowed (signed overflow is UB) and the wrapped,
+// negative total came back as a successful byte count. The batch is now validated before anything
+// is queued; the check is length-only, which is what lets this test run without allocating two
+// gigabytes - the oversized buffer is never dereferenced.
+void TestWriteBuffersRejectsOversizedBatch() {
+  Pair pair;
+  if (!Establish(&pair, kcp::Crypt{}, 0, 0, "oversized")) {
+    return;
+  }
+  const std::size_t too_big = static_cast<std::size_t>((std::numeric_limits<int>::max)()) + 1;
+  std::error_code ec;
+  const int n = pair.client->write_buffers({kcp::ConstBuffer{nullptr, too_big}}, &ec);
+  if (n != -1 || ec != kcp::MakeErrorCode(ErrorCode::kInvalidArgument)) {
+    Fail(__FILE__, __LINE__, "write_buffers: oversized batch not refused with kInvalidArgument");
+  }
+  // A refused batch must have queued nothing: the session still has to carry a normal write.
+  const std::string ping = "ping";
+  if (pair.client->write(ping.data(), ping.size(), &ec) != static_cast<int>(ping.size())) {
+    Fail(__FILE__, __LINE__,
+         "write_buffers: session unusable after a refused batch: " + ec.message());
+    pair.client->close(nullptr);
+    pair.server->close(nullptr);
+    return;
+  }
+  std::vector<char> echo(64);
+  pair.server->SetReadDeadline(AfterMs(5000));
+  const int got = pair.server->read(echo.data(), echo.size(), &ec);
+  if (got != static_cast<int>(ping.size()) ||
+      std::memcmp(echo.data(), ping.data(), ping.size()) != 0) {
+    Fail(__FILE__, __LINE__, "write_buffers: follow-up write did not reach the peer");
+  }
+  pair.client->close(nullptr);
+  pair.server->close(nullptr);
+}
+
 }  // namespace
 
 int main() {
@@ -815,6 +852,7 @@ int main() {
   TestSetMtu();
   TestCurrEstabAccounting();
   TestProfilingCountersDoNotBreakTransfer();
+  TestWriteBuffersRejectsOversizedBatch();
 
   if (g_failures != 0) {
     std::fprintf(stderr, "session_test: %d failure(s)\n", g_failures);

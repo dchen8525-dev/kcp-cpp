@@ -31,22 +31,28 @@ std::uint64_t ProcessCpuMicros();
 // The times are wall clock, not CPU: sendto() on Windows spends roughly half of its 44 us off-CPU,
 // and that gap is exactly what P8.1 is about. `enabled` is checked on every call, so a session that
 // never asks for a profile pays one atomic load per datagram and nothing else.
+//
+// Every counter is atomic (relaxed): the I/O threads write them while profile() reads them from
+// the caller's thread. Reading after close() gives a coherent snapshot because the join provides
+// the happens-before, but a mid-flight read is still legal C++ rather than a data race - each
+// field is a torn-free, individually monotonic total. The cost is a locked RMW per syscall, noise
+// next to the 2.6 us the syscall itself costs (P8.1).
 struct IoCounters {
   std::atomic<bool> enabled{false};
 
-  std::uint64_t send_n = 0;
-  std::uint64_t send_us = 0;
-  std::uint64_t send_err = 0;
-  std::uint64_t recv_n = 0;
-  std::uint64_t recv_us = 0;
-  std::uint64_t recv_err = 0;
+  std::atomic<std::uint64_t> send_n{0};
+  std::atomic<std::uint64_t> send_us{0};
+  std::atomic<std::uint64_t> send_err{0};
+  std::atomic<std::uint64_t> recv_n{0};
+  std::atomic<std::uint64_t> recv_us{0};
+  std::atomic<std::uint64_t> recv_err{0};
   // Non-blocking readiness probe (SysWaitReadable with a zero timeout).
-  std::uint64_t probe_n = 0;
-  std::uint64_t probe_us = 0;
+  std::atomic<std::uint64_t> probe_n{0};
+  std::atomic<std::uint64_t> probe_us{0};
   // Bounded blocking wait. Dominated by idle time rather than by work, so it is reported apart
   // from the probe: it says how much of the loop was waiting, not how much it cost.
-  std::uint64_t wait_n = 0;
-  std::uint64_t wait_us = 0;
+  std::atomic<std::uint64_t> wait_n{0};
+  std::atomic<std::uint64_t> wait_us{0};
 };
 
 // Binds `counters` to the calling thread. Only one profile per thread; nullptr detaches. Threads

@@ -114,10 +114,12 @@ class UdpSession : public std::enable_shared_from_this<UdpSession> {
   int read(void* buf, std::size_t len, std::error_code* ec = nullptr);
 
   // Queues `len` bytes and flushes unless write delay is enabled. Returns the accepted byte count
-  // or -1 with *ec set.
+  // or -1 with *ec set. A request over INT_MAX bytes is refused with kInvalidArgument: the int
+  // return type cannot report it, and nothing is queued when it happens.
   int write(const void* data, std::size_t len, std::error_code* ec = nullptr);
 
-  // Vector form of write(); sizes are split by mss exactly like a single buffer.
+  // Vector form of write(); sizes are split by mss exactly like a single buffer. The batch total
+  // is validated against INT_MAX before anything is queued.
   int write_buffers(const std::vector<ConstBuffer>& bufs, std::error_code* ec = nullptr);
 
   // Idempotent, but a second call reports kClosedPipe (sess.go:470-472). Flushes the tail before
@@ -169,8 +171,10 @@ class UdpSession : public std::enable_shared_from_this<UdpSession> {
   // (~102 ns each, `bench/syscall_cost` CLOCK line).
   //
   // Enable before the traffic starts - the totals only cover the window it was on for. Read
-  // profile() after close(), when both worker threads have been joined; the counters are written
-  // by four different threads and there is no attempt to make a mid-flight snapshot coherent.
+  // profile() after close(), when both worker threads have been joined, for a snapshot that
+  // is stable across all fields at once; a mid-flight read is race-free (every counter is
+  // atomic) but the fields are sampled one at a time, so they need not describe the same
+  // instant.
   void EnableProfiling();
   SessionProfile profile() const;
 
