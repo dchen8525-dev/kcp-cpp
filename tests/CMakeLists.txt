@@ -19,3 +19,10 @@ kcp_add_test(smoke_socket_test smoke_socket_test.cc)
 kcp_add_test(vector_meta_test vector_meta_test.cc json_reader.cc)
 target_compile_definitions(vector_meta_test PRIVATE
   KCP_VECTOR_DIR="${CMAKE_SOURCE_DIR}/tools/golden/out")
+
+kcp_add_test(foundation_test foundation_test.cc)
+kcp_add_test(entropy_test entropy_test.cc)
+
+kcp_add_test(primitives_test primitives_test.cc json_reader.cc)
+target_compile_definitions(primitives_test PRIVATE
+  KCP_VECTOR_DIR="${CMAKE_SOURCE_DIR}/tools/golden/out")
