@@ -14,8 +14,15 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 # Sources are listed explicitly (no GLOB): a missing file must fail the build, not be silently
 # skipped. Each stage of PORTING-PLAN.md appends to this list.
 set(KCP_SOURCES
+  src/crypt.cc
+  src/error.cc
+  src/internal/aes.cc
   src/internal/bufferpool.cc
+  src/internal/cfb.cc
+  src/internal/gcm.cc
   src/internal/primitives.cc
+  src/internal/salsa20.cc
+  src/internal/tea.cc
   src/platform/entropy_backend.cc
   src/platform/socket.cc
   src/snmp.cc

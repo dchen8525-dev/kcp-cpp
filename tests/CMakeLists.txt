@@ -26,3 +26,11 @@ kcp_add_test(entropy_test entropy_test.cc)
 kcp_add_test(primitives_test primitives_test.cc json_reader.cc)
 target_compile_definitions(primitives_test PRIVATE
   KCP_VECTOR_DIR="${CMAKE_SOURCE_DIR}/tools/golden/out")
+
+kcp_add_test(aes_test aes_test.cc)
+kcp_add_test(gcm_test gcm_test.cc)
+kcp_add_test(salsa20_test salsa20_test.cc)
+
+kcp_add_test(crypt_test crypt_test.cc json_reader.cc)
+target_compile_definitions(crypt_test PRIVATE
+  KCP_VECTOR_DIR="${CMAKE_SOURCE_DIR}/tools/golden/out")

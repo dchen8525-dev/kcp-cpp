@@ -1,6 +1,6 @@
-# kcp-cpp 移植计划 v5.5（参考 xtaci/kcp-go v5）
+# kcp-cpp 移植计划 v5.6（参考 xtaci/kcp-go v5）
 
-> 状态：**实施中**（v5.5，累计 20 轮对抗分析（75 条）+ 命名合规审计 + 源码逐行核验 + 用户决策；**P0 已完成**，见 §6）
+> 状态：**实施中**（v5.6，累计 20 轮对抗分析（75 条）+ 命名合规审计 + 源码逐行核验 + 用户决策；**P0 / P1 / P2 已完成**，见 §6）
 > 目标：将 D:\work\kcp-go（Go）完整移植为 C++17 库，输出到 D:\work\kcp-cpp，零第三方依赖。
 > 已确认决策：① 加密层自包含实现；② Reed-Solomon 自实现；③ 验收含跨语言互通；
 > ④ **定位 = 全量独立库**（含 session 层，与 kcp-proxy-cpp 解耦，集成另行议）；
@@ -100,6 +100,19 @@
 | 89 | **`build.bat` 增 Windows SDK 回退**：`vcvars64.bat` 依赖 `reg.exe`，受限 shell 下静默失败，表现为 `LNK1104: kernel32.lib`；回退到标准 SDK 根下最新版本 | 实施发现 |
 | 90 | **新增环境阻塞 E1**：本机 WSL 被禁用且无独立 g++，Linux 侧 `build.sh` 冒烟未执行；Windows 侧 Debug/Release 全绿 | 环境 |
 | 91 | §4.7 常量表补齐 `convSize=4` 并逐条补行号（sess.go/fec.go） | P0 门禁 |
+
+### v5.5 → v5.6 修订摘要（P1 + P2 实施，非分析轮次）
+
+| 编号 | 修订 | 依据 |
+|---|---|---|
+| **92** | **P1 完成**：crc32/sha1/hmac/pbkdf2、双后端 `FillRand`、30 项 snmp、定长 bufferpool；`primitives_test`/`foundation_test`/`entropy_test` 全绿 | 实施 |
+| **93** | **P2 完成**：AES(双路径)/GCM/Salsa20/TEA/XTEA/SimpleXOR/None + CFB + 双接口工厂；新增 `include/kcp/error.h`（§3.4 的 `ErrorCode` + `error_category`）——P1 遗留但 P2 工厂立即需要 | 实施 |
+| **94** | **GHASH 位序判定**：块内是"首字节 MSB = x^0"、右移、归约 `0xE1` 入 byte 0；错解会让**密文全对而 tag 全错**（详见 §6 P2 实施记录 #1） | `crypt.json` aesgcm + NIST TC2 双仲裁 |
+| **95** | **XTEA 表推进一次/对轮**，多推一次即全错（§6 P2 实施记录 #2） | `crypt.json` xtea 向量 |
+| 96 | **TEA 轮数钉死为 16**（`tea.NewCipherWithRounds(key, 16)`，crypt.go:246），不是 x/crypto 默认 64；此前只在 §3.3 提了工厂名 | crypt.go:246 |
+| 97 | **Salsa20 计数器每调用重启**：`salsa20.XORKeyStream` 每次重建 16B 输入块，跨包不复用 keystream，安全性依赖每包随机 nonce 头 | salsa20.go:56-57, salsa20_ref.go:207 |
+| 98 | **新增偏离 D9**：CFB 反馈寄存器用栈上数组，`BlockCrypt` 无可变状态 → `Encrypt/Decrypt` 为 `const`，**L1 锁取消**（§3.2 表同步） | 实施 |
+| 99 | 风险表补 R17/R18（GHASH 约定、XTEA 节奏），两者均为 P2 实际踩中的"静默错密文"级问题 | 实施 |
 
 ---
 
@@ -205,13 +218,13 @@ TimedSched 延迟回调        → std::weak_ptr<UdpSession>（回调内 lock() 
 | 级别 | 锁 | 保护对象 |
 |---|---|---|
 | L0 | 原子 | Snmp 计数、状态位 |
-| L1 | `BlockCrypt` 工作缓冲互斥 `enc_mu_`/`dec_mu_`（**仅 CFB 系；AEAD 无状态无锁**，#44） | 加密工作缓冲 |
+| ~~L1~~ | ~~`BlockCrypt` 工作缓冲互斥 `enc_mu_`/`dec_mu_`~~ **已取消（D9）** | CFB 反馈寄存器改栈上局部变量，实现无共享可变状态 |
 | L2 | `UdpSession::mu_` | KCP 状态、recv_buf_、FEC 编解码器、写队列 |
 | L3 | `Listener::session_lock_` | sessions 映射、accept 队列 |
 
 通道/队列成员（Go channel → C++ 封装）：`chReadEvent`→`read_event_`、`chWriteEvent`→`write_event_`、`chSocketReadError`→`socket_read_error_`、`chSocketWriteError`→`socket_write_error_`、`chPostProcessing`→`post_processing_`（BlockingQueue，满则丢，#38）。
 
-1. 加锁顺序 **L3 → L2 → L1**
+1. 加锁顺序 **L3 → L2**（原 L3→L2→L1 的 L1 已由 D9 取消）
 2. **阻塞等待必须释放 L2**：`cv_.wait_until(lk, deadline, pred)`；禁止持 L2 调 sleep/join/sendto
 3. `PostProcess` 调平台层发送前已释放 L2
 4. 回调（TimedSched/accept/OOB handler）**不得持锁调用用户代码**；OOB handler 由 KCP 输入路径同步调用，文档要求"MUST 快速返回、不得阻塞"（照抄 sess.go:845-848）
@@ -367,6 +380,7 @@ std::shared_ptr<UdpSession> Listener::Accept(std::error_code* ec = nullptr);
 | D6 | 字节切片参数 | `[][]byte` / `[]byte` | `std::vector<ConstBuffer>` / `void*+len` | 语言差异 |
 | D7 | session 生命周期 | GC + goroutine 自然退出 | `shared_ptr` + join | 资源管理是总原则的明确例外（§3.1） |
 | D8 | 行宽 | —（Go 用 gofmt，无 80 列硬限） | **100 列**（Google C++ Style 要求 80） | 密码学 T 表、hex 黄金向量、wire 布局注释在 80 列内不可读；`.clang-format: BasedOnStyle Google, ColumnLimit 100` |
+| D9 | CFB 工作缓冲 | 实例持有 `encbuf`/`decbuf` + `encMu`/`decMu`（crypt.go:130-158），`Encrypt/Decrypt` 需加锁 | 反馈寄存器用**栈上局部数组**，`BlockCrypt` 无共享可变状态 → `Encrypt/Decrypt` 声明为 `const`，L1 锁取消 | 每连接一个 crypt 实例，缓冲本就无跨线程复用价值；省掉两把锁与一次内存写。并发安全由"无可变状态"保证，强于加锁 |
 
 ### 3.5 全局对象与静态生命周期（#32/#33）
 
@@ -630,14 +644,35 @@ C++ 侧：`tests/json_reader.{h,cc}`（<120 行扁平解析器，只支持上述
 | 构建环境 | — | `build.bat` 增加 Windows SDK 回退（vcvars 依赖 `reg.exe`，受限 shell 下会失败） | 沙箱与部分 CI 环境屏蔽 reg.exe，否则报 `LNK1104: kernel32.lib` |
 | 门禁脚本 | `check_guard.py`（5 行） | `check_guard.py` + `check_format.py` 并入 `build.bat` | 计划要求两条门禁，统一由构建脚本执行 |
 
-### P1 基础原语（1d）
+### P1 基础原语（1d）—— ✅ 已完成
 crc32/sha1/pbkdf2/`FillRand`/snmp/bufferpool（全局单例按 §3.5；pool 按 `kMtuLimit`=1500 定长切分，#49；`FillRand` 双后端 BCryptGenRandom/getrandom）。
 **门**：CRC32("123456789")=0xCBF43926；SHA-1/PBKDF2 标准向量；与 `crypt.json` CRC 字段一致；两平台熵源均产出非全零缓冲。
+- [x] CRC-32 IEEE 用例 + `frame.json` 的 CRC 字段对拍；FIPS 180-1 SHA-1、RFC 2202 HMAC、RFC 6070 PBKDF2（`primitives_test`）
+- [x] `FillRand` 长度遵守（canary）、非全零、256 次取值互异（`entropy_test`）
+- [x] bufferpool 定长/拒收异容量/取回互异，snmp 计数与表头顺序（`foundation_test`）
+- [ ] Linux `getrandom(2)` 分支未实测（E1 环境阻塞同前）
 
-### P2 加密层（2.5d）
+### P2 加密层（2.5d）—— ✅ 已完成
 AES（**AES-NI intrinsics + cpuid 检测 + T 表回退**，决策⑥）→ GCM(GHASH) → Salsa20 → TEA/XTEA → CFB 变体（**§4.3 残字节规则**）→ 双接口工厂（§3.8）。
 **注意**：Salsa20 语义须为 `XORKeyStream(dst+8, src+8, nonce=src[0:8], key)`，即**前 8 字节明文透传**，其余以首 8 字节作 64 位 nonce 做 Salsa20 流加密（crypt.go:175-181）。
-**门**：FIPS-197 / NIST GCM / Salsa20 公开向量；**`crypt.json` 全算法逐字节**（CFB 8B/16B 两路径 × 对齐/非对齐长度；AES 的 AES-NI 与 T 表**两条**路径输出必须一致）；AEAD 容量不足返回错误不 panic；**AES-NI 与 T 表路径交叉互验**（同一 key 分别用两条路径加密，密文相同）。
+**门**：
+- [x] FIPS-197 附录 C.1/C.2/C.3（128/192/256）逐字节 —— `tests/aes_test.cc`，T 表与 AES-NI 两条路径各自跑一遍
+- [x] NIST GCM SP 800-38D test case 2（全零）+ test case 3 输入（60B 明文、无 AAD）—— `tests/gcm_test.cc`；后者期望值由 Go `crypto/aes`+`cipher.NewGCM` 产出
+- [x] Salsa20 ECRYPT set 6（8B nonce）keystream —— `tests/salsa20_test.cc`
+- [x] **`crypt.json` 全算法逐字节**：9 算法 × {64B, 37B} = 18 条，`tests/crypt_test.cc` 逐字节 + 往返 + in-place；非对齐 37B 覆盖 §4.3 残字节规则
+- [x] **AES-NI 与 T 表交叉互验**：512 个随机块 × 3 种 key 长度逐字节相同（`aes_test`），且 AES-CFB 的 wire 密文由两条路径各自复现（`crypt_test`）
+- [x] AEAD 容量不足返回 `kBufferTooSmall` 而非 panic（D1）；tag 被篡改/长度 < tag 返回 `kIntegrityFailed`
+- [x] `check_guard` 14 headers / `check_format` 37 files / `ctest` 9/9 全绿
+
+#### P2 实施记录（v5.6，两条**会静默产出错密文**的坑，均已定位）
+
+| # | 坑 | 症状 | 正解 | 取证 |
+|---|---|---|---|---|
+| 1 | **GHASH 位序约定** | AES-GCM 密文全对、**只有 tag 错**（说明 CTR 对、乘法错） | GCM 的块内位序是 **首字节的 MSB = 系数 x^0**（即"1"的块表示为 `0x80 00 …`）。乘 x 时整串**右移**、进位从 byte15 的 LSB 溢出，归约常量加在 **byte 0** 且掩码为 **`0xE1`**（x^128=x^7+x^2+x+1 → 位下标 7,2,1,0 → 掩码 0x01\|0x20\|0x40\|0x80）。按"MSB=x^127 + 0x87 入 byte15"写会得到完全不同的 tag | 用 Go `crypto/aes`+`cipher.NewGCM` 反解 `S = tag ⊕ E(J0)`，再以 big.Int 多项式乘法（正/反两种位序）比对，反序版唯一命中 |
+| 2 | **XTEA 表推进节奏** | XTEA 密文全错，其余算法全对 | `xtea/cipher.go:85-93` 每对轮**只 `sum += delta` 一次**：偶数项用当前 sum 构造并推进，奇数项复用推进后的 sum 且键下标取 `(sum>>11)&3`；循环每轮末尾**不再推进**。多推一次会让 `table[2]` 之后全部错位 | 与 `crypt.json` 的 `xtea` 向量逐字节对拍 |
+
+附带确认（此前未钉死的参数）：`NewTEABlockCrypt` 走 `tea.NewCipherWithRounds(key, 16)` —— **TEA 是 16 轮，不是 x/crypto 默认的 64 轮**（crypt.go:246）；Salsa20 的计数器**每次调用从 0 重启**（`salsa20.XORKeyStream` 每次重建 16B 输入块），因此 kcp-go 每包依赖随机 nonce 头去重，跨包不复用 keystream。
+
 
 ### P3 Reed-Solomon（2d）
 GF(2⁸) 表 → 系统性 Vandermonde（Vandermonde → 顶部子阵求逆 → 左乘）→ Encode/ReconstructData。
@@ -729,6 +764,8 @@ socket RAII（**platform/socket 双实现**，决策⑤）→ ringbuffer/`Blocki
 | R14 | **output 队列"满则丢"被实现成阻塞**（持锁死锁，#38） | §3.6 + P6 队列满场景测试 |
 | R15 | RS 等长契约被下压到 RS 层（补齐逻辑重复实现，#41） | §3/P3 接口契约：补齐归 P4 |
 | R16 | **平台行为分叉**（双平台下 socket 选项/调度差异，决策⑤） | platform 抽象层收敛差异；P6 门禁双平台全量回归；§6.3 基线双平台各测 |
+| R17 | **GHASH 位序/归约常量搞反**（密文对、tag 错，P2 已实际踩中） | §6 P2 实施记录 #1 的判定方法（`S = tag ⊕ E(J0)` 反解 + big.Int 反序比对）；`gcm_test` 双向量 + `crypt.json` 两个 aesgcm 长度 |
+| R18 | **XTEA 表推进节奏错位**（每对轮多推进一次 sum，P2 已实际踩中） | §6 P2 实施记录 #2；`crypt.json` xtea 向量逐字节 |
 
 ---
 
