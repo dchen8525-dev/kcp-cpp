@@ -42,3 +42,8 @@ target_compile_definitions(rs_test PRIVATE
 kcp_add_test(fec_test fec_test.cc json_reader.cc)
 target_compile_definitions(fec_test PRIVATE
   KCP_VECTOR_DIR="${CMAKE_SOURCE_DIR}/tools/golden/out")
+
+kcp_add_test(ringbuffer_test ringbuffer_test.cc)
+kcp_add_test(kcp_test kcp_test.cc json_reader.cc)
+target_compile_definitions(kcp_test PRIVATE
+  KCP_VECTOR_DIR="${CMAKE_SOURCE_DIR}/tools/golden/out")

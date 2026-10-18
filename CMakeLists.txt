@@ -16,9 +16,11 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 set(KCP_SOURCES
   src/crypt.cc
   src/error.cc
+  src/kcp.cc
   src/internal/aes.cc
   src/internal/bufferpool.cc
   src/internal/cfb.cc
+  src/internal/clock.cc
   src/internal/fec.cc
   src/internal/galois.cc
   src/internal/gcm.cc

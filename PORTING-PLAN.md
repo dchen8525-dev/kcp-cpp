@@ -1,6 +1,6 @@
-# kcp-cpp 移植计划 v5.8（参考 xtaci/kcp-go v5）
+# kcp-cpp 移植计划 v5.9（参考 xtaci/kcp-go v5）
 
-> 状态：**实施中**（v5.8，累计 20 轮对抗分析（75 条）+ 命名合规审计 + 源码逐行核验 + 用户决策；**P0 / P1 / P2 / P3 / P4 已完成**，见 §6）
+> 状态：**实施中**（v5.9，累计 20 轮对抗分析（75 条）+ 命名合规审计 + 源码逐行核验 + 用户决策；**P0 ~ P5 已完成**，见 §6）
 > 目标：将 D:\work\kcp-go（Go）完整移植为 C++17 库，输出到 D:\work\kcp-cpp，零第三方依赖。
 > 已确认决策：① 加密层自包含实现；② Reed-Solomon 自实现；③ 验收含跨语言互通；
 > ④ **定位 = 全量独立库**（含 session 层，与 kcp-proxy-cpp 解耦，集成另行议）；
@@ -123,6 +123,17 @@
 | 102 | **`ReconstructData` 的 parity 语义显式化**：数据片齐全时它**不**补 parity（reedsolomon.go:1186 的 `dataOnly` 提前返回）；需补 parity 必须调 `Reconstruct`。P4 解码器只关心数据片，故用前者 | 实施 + 测试踩中 |
 | 103 | 风险表补 R19：RS 层**不做**补齐/清零，长度不齐一律 `kInvalidArgument`（#41 的落地形态）——若把这层职责下沉到 RS，P4 的 padding bug 会被静默吸收 | 实施 |
 
+### v5.8 → v5.9 修订摘要（P5 实施，非分析轮次）
+
+| 编号 | 修订 | 依据 |
+|---|---|---|
+| **110** | **P5 完成**：`kcp.h` / `kcp.cc`（Kcp 状态机）+ `internal/{ringbuffer,kcp_segment,clock}.h` + `internal/clock.cc`；新增 `kcp_test` / `ringbuffer_test` | 实施 |
+| 111 | **§6.2 丢包中继落地为进程内 `Relay` + 注入式虚拟时钟**，UDP socket 形态推迟到 P6 | 实施（新增偏离 D13） |
+| 112 | **新增偏离 D12**：段载荷改为 owning `std::vector`，取消 `newSegment` / `recycleSegment` 的池化契约 | 实施 |
+| 113 | **`Kcp::Flush` 返回 `void`**：Go 的 `nextUpdate` 在三处调用（Input / Update / close）全被丢弃 | 源码核验 |
+| 114 | **新增 `Kcp::IsDead()`**：Go 的 `state` 全仓只写不读；C++ 侧 dead_link 门禁与 P6 判活需要它 | 源码核验 + 实施 |
+| 115 | 记录并测试 **flush 首帧空转**（`cwnd` 初值 0 → 首帧不发段，Phase 6 抬到 1 后下一 tick 才发） | 实施（`TestCwndBootstrap`） |
+
 ### v5.7 → v5.8 修订摘要（P4 实施，非分析轮次）
 
 | 编号 | 修订 | 依据 |
@@ -178,8 +189,8 @@ D:\work\kcp-cpp\
 ├── CMakeLists.txt / CMakePresets.json / .clang-format / build.bat / build.sh
 ├── PORTING-PLAN.md / LICENSE / README.md / .gitignore
 ├── include/kcp/{kcp,crypt,udp_session,listener,snmp}.h
-├── include/kcp/internal/{primitives,entropy,byteorder,aes,gcm,salsa20,tea,cfb,bufferpool,
-│                        galois,rs,fec,ringbuffer,blocking_queue,timedsched}.h
+├── include/kcp/internal/{primitives,entropy,clock,byteorder,aes,gcm,salsa20,tea,cfb,
+│                        bufferpool,galois,rs,fec,ringbuffer,kcp_segment,
 ├── include/kcp/platform/{socket,entropy_backend}.h   # 决策⑤：WinSock2/POSIX 双实现
 ├── src/...                      # 与 include 同名 .cc，文件头注释含 MIT 出处
 ├── tests/                       # 集成测试串行执行；端口 = base + (pid % 1000)
@@ -403,6 +414,8 @@ std::shared_ptr<UdpSession> Listener::Accept(std::error_code* ec = nullptr);
 | D9 | CFB 工作缓冲 | 实例持有 `encbuf`/`decbuf` + `encMu`/`decMu`（crypt.go:130-158），`Encrypt/Decrypt` 需加锁 | 反馈寄存器用**栈上局部数组**，`BlockCrypt` 无共享可变状态 → `Encrypt/Decrypt` 声明为 `const`，L1 锁取消 | 每连接一个 crypt 实例，缓冲本就无跨线程复用价值；省掉两把锁与一次内存写。并发安全由"无可变状态"保证，强于加锁 |
 | D10 | RS 编解码器的可见性 | 无对应公开 API（`klauspost/reedsolomon.New` 是依赖，`fecEncoder/fecDecoder` 未导出） | `include/kcp/internal/rs.h`，**不建** `include/kcp/reedsolomon.h` | 与 Go 的可见性一致：RS 是 FEC 层的实现细节；对外只暴露 `FEC` 配置与 `SetFEC` |
 | D11 | FEC 分片缓冲的所有权 | #42 设计：池化 buffer，恢复成功移交调用者、失败自回收 | `FecPacket` = owning `std::vector`；恢复出的分片直接 move 给调用者，失败时随栈销毁 | 偏离的是「协议」而非行为：RAII 让移交/回收这组约定不存在，少一类泄漏与二次释放路径。池只用于 P6 的收发缓冲 |
+| D12 | KCP 段载荷的所有权 | `defaultBufferPool.Get()[:size]` + `recycleSegment` 手工归还（kcp.go:284-297） | `Segment::data` = owning `std::vector`；段被丢弃时随析构释放 | 与 D11 同源：KCP 有 4 条段丢弃路径（ACK 覆盖 / una 越过 / recv 弹出 / heap 弹出），逐条手工归还是泄漏与二次归还的温床。实测 1 MiB 传输里 762 段、每次 malloc 约 50ns，相对 1.4KB memcpy 可忽略（P7 实测若超基线再引入池） |
+| D13 | 丢包中继的形态 | §6.2：UDP socket 一对 + 双线程转发，实时运行 | 进程内 `Relay`（`std::deque` + 注入式 `Clock`）；丢包模型与 §6.2 一致（均匀 + Gilbert-Elliott） | KCP 没有 I/O，只有 `output` 回调；socket 只增加实时抖动和端口/线程依赖。虚拟时钟让 30% 丢包场景可复现、毫秒级跑完。**P6 会补真 UDP 中继**：那里才有 socket 语义需要验 |
 
 ### 3.5 全局对象与静态生命周期（#32/#33）
 
@@ -743,10 +756,36 @@ fecEncoder/fecDecoder/shardHeap；autotune 仅挂点。
 | 时间基准 | — | `steady_clock` 毫秒，而非 `time.Now().UnixMilli()` | 唯一用途是两次数据包的间隔比较；墙钟跳变会把“突发”误判为“非连续”（少发 parity）或反之 |
 | **黄金向量缺口（本轮补上）** | `fec.json` 只有等长场景 | 新增 `encode-varlen`：同一 encoder 的**第二轮**，10 个 shard 载荷 200/187/…/83 字节 | 等长向量里 `maxSize − len == 0`，**尾部补零规则一次都没被走到**：变异测试（删掉 memset）不是断言失败而是直接越界崩溃，说明该路径无数据对拍。补向量后同一变异由 `varlen parity packet 0/1/2 mismatch` 精确捕获 |
 
-### P5 KCP 核心（3.5d）
+### P5 KCP 核心（3.5d）—— ✅ 已完成
+
 kcp.go 逐函数移植（含 §4.6 全部默认值、§4.8 dead_link）。
-**门**：`kcp.json`（ts 掩码）逐字节；移植 kcp_test；**§6.2 丢包中继** 0%/10%/30% 下 1MB 完整（注意 #25 判死阈值）；**MTU 边界**（payload = mtu-1/mtu/mtu+1 验证 frg 分段重组）。
-**时限（#69）**：30% 丢包场景单次传输**上限 120s**（RTO 指数退避 + 1MB/1348B ≈ 780 段，理论重传量约 1.4×/段）；超时即判失败并记录 `xmit` 最大值，**不得无限等待**。若 `dead_link` 被触发（state=0xFFFFFFFF），属测试参数不当而非实现缺陷——先降丢包率到 20% 复测。
+**时限（#69）**：30% 丢包场景单次传输**上限 120s**；超时即判失败并记录重传计数，**不得无限等待**。若 `dead_link` 被触发（state=0xFFFFFFFF），属测试参数不当而非实现缺陷。
+**门**：
+
+- [x] **`kcp.json` 逐字节**：消息模式（frg 2/1/0，载荷 1376/1376/248）与流模式（3 段全 frg=0）两组；ts（偏移 8..11）掩码后比对，且**掩码前先断言这 4 字节 == 注入的时钟值**（4321），堵住"忘了写 ts 也能过"的口子
+- [x] 移植 kcp_test：`TestSegmentHeap`（含 32 位绕回序 0xFFFFFFFE < 0xFFFFFFFF < 0 < 1）、`TestSetMtuBoundary`（−1 / 0 / 23 / 24 / 25 / 1400，并验证 mss=1 时每段恰好 25 字节）
+- [x] **§6.2 丢包中继** 0% / 10% / 30%：1 MiB 载荷逐字节一致，虚拟耗时 **4.7s / 9.1s / 17.6s**，重传 **0 / 88 / 572**，全程未触发 dead_link（30% 场景离 120s 预算有一个数量级余量）
+- [x] **MTU 边界**：payload = 1 / mss−1 / mss / mss+1 / 2·mss / mtu−1 / mtu / mtu+1 共八档；段数 = ⌈len/mss⌉，对端 `PeekSize` 返回整条消息长度、`Recv` 内容逐字节相等
+- [x] **流模式合并**：两次 Send（100B + 50B）合并为一个 150B 段，字节顺序不变
+- [x] **接收侧语义**：后到分片不可读（`PeekSize` = −1）→ 前片到达后可读；缓冲差 1 字节返回 −2 **且不消费**；读空返回 −1
+- [x] **Input 错误码**：短包 −1、conv 不匹配 −1、长度字段越界 −2、未知命令 −3
+- [x] **重复包**：同一段投递两次只累加 `repeat_segs`，不重复入队，且 ACK 照常重发
+- [x] **拥塞控制开启**（nc=0）：1 MiB @ 10% 丢包 **56.3s** 完成，覆盖慢启动 + AIMD + RTO 回退路径
+- [x] **dead_link**：100% 丢包下 20 次重传后 `IsDead()` 为真且传输不完成
+- [x] `check_guard` 22 headers / `check_format` 54 files / `ctest` 13/13 全绿（Debug + Release）
+
+#### P5 实施记录（v5.9）
+
+| 项 | 计划 | 实际 | 原因 |
+|---|---|---|---|
+| 段载荷 | 沿用 bufferpool（`newSegment` / `recycleSegment`） | `std::vector<std::uint8_t>` 独占 | 偏离 **D12**：池化的真实代价是"每条丢弃路径都要记得归还"（acked / una 越过 / recv 弹出 / heap 弹出），RAII 把这组生命周期约定整组消掉；每段约 1 次 malloc，相对一次 memcpy 可忽略 |
+| 丢包中继形态 | §6.2 的 UDP socket 一对 + 双线程 | 进程内 `Relay` + 注入式虚拟时钟（`Clock`） | 偏离 **D13**：KCP 是纯状态机，`output` 回调就是传输边界，套 socket 只会引入实时抖动。虚拟时钟让"30% 丢包 × 1 MiB"从"可能 20s+"变成 17.6s 虚拟时间 / 实跑 60ms，且完全可复现。**真 UDP 中继留到 P6**（那时才有 session 需要验） |
+| `flush` 返回值 | `uint32` nextUpdate | `void` | Go 的三处调用（`Input` / `Update` / close）全部忽略返回值；留一个没人读的返回值只会诱导误用 |
+| `ParseData` 签名 | `parse_data(segment)` 传值 | `ParseData(header, payload, len)`，载荷只在非重复时拷贝 | Go 的 `segment.data` 是输入缓冲的切片，传值只拷切片头、随后才深拷贝；C++ 里若先拷进 Segment 再判重，重复包要多付一次 memcpy |
+| 日志 | 编译期开关（`debug` build tag） | 运行期掩码 + 惰性 lambda 组串 | Go 默认构建里 `debugLog` 是空函数；这里保留"默认零成本"（一个分支）但不必重编库就能开 trace |
+| `state` 可见性 | — | 新增 `IsDead()` | Go 的 `state` 全仓只写不读；dead_link 门禁要断言、P6 判活也要用 |
+| **flush 首帧空转** | — | 照抄：`cwnd` 初值 0 → 首次 flush 一段都不发，Phase 6 把 cwnd 抬到 1，下一 tick 才发首段 | KCP 原始实现就是这个行为（`ikcp_flush` 末尾 `if (cwnd < 1) cwnd = 1`）。移植时"顺手修好"会让首帧与 Go 不一致；`TestCwndBootstrap` 钉住，其余用例显式 `NoDelay(..., nc=1)` 绕开 |
+| 段缓冲扩容 | — | `SetMtu` 缩小后仍可能发出旧的大段：`ensure_capacity` 按需扩 buffer | Go 在同样场景下会 `ptr = ptr[len(data):]` 越界 panic（缓冲按新 mtu 分配）；C++ 不能 UB，选择扩容把旧段完整发出去而不是截断 |
 
 ### P6 会话层（5d）
 socket RAII（**platform/socket 双实现**，决策⑤）→ ringbuffer/`BlockingQueue`(**满则丢**，#38)/`TimedSched`（单线程 + §3.5 生命周期）→ `UdpSession` 管线（**§3.6 read/write 语义、§3.7 SetMtu、§3.8 双接口**）→ `Listener` → OOB/keepalive/deadline/限速/DSCP。
@@ -826,6 +865,7 @@ socket RAII（**platform/socket 双实现**，决策⑤）→ ringbuffer/`Blocki
 | R18 | **XTEA 表推进节奏错位**（每对轮多推进一次 sum，P2 已实际踩中） | §6 P2 实施记录 #2；`crypt.json` xtea 向量逐字节 |
 | R19 | **RS 层擅自吸收补齐职责**（对不等长分片做 padding/truncate，掩盖 P4 的 padding bug） | RS 对不等长一律 `kInvalidArgument`（`rs_test::TestEncodeRejectsBadShapes`）；补齐只在 P4 做，且 P4 门禁有 `fec.json` 逐字节对拍 |
 | R20 | RS 的 owning `ShardSet` 接口让 FEC 每包多一跳 ~1.4KB memcpy（Go 用 alias 免掉这一跳） | 先实测：P6/P7 吞吐若低于 Go 基线 30%，再给 RS 加 `EncodeView` / `ReconstructView`（视图 + 调用方预分配）；现在动手属未测先改 |
+| R21 | **flush 首帧空转被"顺手修好"**（`cwnd` 初值 0 时首帧不发段，看起来像 bug） | `TestCwndBootstrap` 钉住；`kcp.json` 首帧向量在 nc=1 下不受 cwnd 影响，两条路径都要保留 |
 
 ---
 
@@ -843,3 +883,4 @@ socket RAII（**platform/socket 双实现**，决策⑤）→ ringbuffer/`Blocki
 - [ ] 性能基线落 README（§6.3 方法，双平台各测），与 Go 版差距明确
 - [ ] 并发/生命周期测试后线程与句柄无泄漏，进程退出不 terminate
 - [ ] **双平台**：Windows + Linux 构建、测试、互通冒烟全部通过（决策⑤）
+
