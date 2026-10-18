@@ -1,0 +1,804 @@
+// Golden vector emitter for kcp-cpp.
+//
+// This file is NOT compiled as part of kcp-cpp. It is injected into the kcp-go package with
+// `go test -overlay` (see gen.go) so it can reach unexported symbols (fecEncoder, fecDecoder,
+// initialVector, ...). The vectors it writes are the byte-level oracle the C++ port is held to:
+// a mismatch means a porting bug, never a vector bug.
+//
+// Invoked by: go test -overlay=overlay.json -run TestEmitGoldenVectors github.com/xtaci/kcp-go/v5
+
+package kcp
+
+import (
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"hash/crc32"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/klauspost/reedsolomon"
+)
+
+const goldenSchema = 1
+
+type goldenMeta struct {
+	Schema      int    `json:"schema"`
+	GoVersion   string `json:"go_version"`
+	KcpGoCommit string `json:"kcp_go_commit"`
+	GeneratedAt string `json:"generated_at"`
+	Generator   string `json:"generator"`
+}
+
+type goldenEnvelope struct {
+	Meta    goldenMeta `json:"meta"`
+	Vectors interface{} `json:"vectors"`
+}
+
+func goldenOutDir(t *testing.T) string {
+	t.Helper()
+	dir := os.Getenv("KCP_GOLDEN_OUT")
+	if dir == "" {
+		t.Fatalf("KCP_GOLDEN_OUT is not set")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("cannot create %s: %v", dir, err)
+	}
+	return dir
+}
+
+func goldenMetaNow() goldenMeta {
+	commit := "unknown-commit"
+	if out, err := exec.Command("git", "rev-parse", "HEAD").Output(); err == nil {
+		trimmed := strings.TrimSpace(string(out))
+		if len(trimmed) >= 7 {
+			commit = trimmed
+		}
+	}
+	return goldenMeta{
+		Schema:      goldenSchema,
+		GoVersion:   runtime.Version(),
+		KcpGoCommit: commit,
+		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+		Generator:   "tools/golden/ref/golden_ref.go",
+	}
+}
+
+func goldenWrite(t *testing.T, dir, name string, vectors interface{}) {
+	t.Helper()
+	envelope := goldenEnvelope{Meta: goldenMetaNow(), Vectors: vectors}
+	data, err := json.MarshalIndent(envelope, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal %s: %v", name, err)
+	}
+	data = append(data, '\n')
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+	t.Logf("wrote %s (%d bytes)", path, len(data))
+}
+
+func goldenHex(b []byte) string { return hex.EncodeToString(b) }
+
+// goldenPattern produces deterministic, non-repeating payload bytes.
+func goldenPattern(n int, seed byte) []byte {
+	out := make([]byte, n)
+	for i := range out {
+		out[i] = byte((i*31 + int(seed)) & 0xff)
+	}
+	return out
+}
+
+func goldenClone(b []byte) []byte {
+	out := make([]byte, len(b))
+	copy(out, b)
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// crypt.json
+// ---------------------------------------------------------------------------
+
+type cryptVector struct {
+	Algo      string `json:"algo"`
+	BlockSize int    `json:"block_size"`
+	KeyHex    string `json:"key_hex,omitempty"`
+	PlainHex  string `json:"plain_hex,omitempty"`
+	CipherHex string `json:"cipher_hex"`
+	NonceHex  string `json:"nonce_hex,omitempty"`
+	TagHex    string `json:"tag_hex,omitempty"`
+}
+
+func goldenCryptFactory(t *testing.T, algo string, key []byte) BlockCrypt {
+	t.Helper()
+	var (
+		c   BlockCrypt
+		err error
+	)
+	switch algo {
+	case "aes128cfb", "aes192cfb", "aes256cfb":
+		c, err = NewAESBlockCrypt(key)
+	case "tea":
+		c, err = NewTEABlockCrypt(key)
+	case "xtea":
+		c, err = NewXTEABlockCrypt(key)
+	case "salsa20":
+		c, err = NewSalsa20BlockCrypt(key)
+	case "simplexor":
+		c, err = NewSimpleXORBlockCrypt(key)
+	case "none":
+		c, err = NewNoneBlockCrypt(key)
+	case "aesgcm":
+		c, err = NewAESGCMCrypt(key)
+	default:
+		t.Fatalf("unknown algo %q", algo)
+	}
+	if err != nil || c == nil {
+		t.Fatalf("%s: factory failed: %v", algo, err)
+	}
+	return c
+}
+
+func buildCryptVectors(t *testing.T) []cryptVector {
+	key16 := goldenPattern(16, 1)
+	key24 := goldenPattern(24, 2)
+	key32 := goldenPattern(32, 3)
+
+	type algoSpec struct {
+		name      string
+		key       []byte
+		blockSize int
+	}
+	specs := []algoSpec{
+		{"aes128cfb", key16, 16},
+		{"aes192cfb", key24, 16},
+		{"aes256cfb", key32, 16},
+		{"tea", key16, 8},
+		{"xtea", key16, 8},
+		{"salsa20", key32, 8},
+		{"simplexor", key16, 16},
+		{"none", key16, 16},
+	}
+
+	// Aligned and non-aligned lengths: the CFB tail rule (#43) only shows up off-block, and a
+	// cipher that silently consumes whole blocks would pass the aligned case.
+	lengths := []int{64, 37}
+
+	var vectors []cryptVector
+	for _, spec := range specs {
+		c := goldenCryptFactory(t, spec.name, spec.key)
+		for _, length := range lengths {
+			plain := goldenPattern(length, byte(length))
+			dst := make([]byte, len(plain))
+			c.Encrypt(dst, plain)
+			vectors = append(vectors, cryptVector{
+				Algo:      spec.name,
+				BlockSize: spec.blockSize,
+				KeyHex:    goldenHex(spec.key),
+				PlainHex:  goldenHex(plain),
+				CipherHex: goldenHex(dst),
+			})
+			// Round-trip must hold for every algorithm; a vector whose decryption disagrees with
+			// its own encryption would poison every later stage.
+			back := make([]byte, len(plain))
+			c.Decrypt(back, dst)
+			if string(back) != string(plain) {
+				t.Fatalf("%s: decrypt(encrypt(x)) != x for len=%d", spec.name, length)
+			}
+		}
+	}
+
+	// AES-GCM: Seal/Open instead of Encrypt/Decrypt (the latter panic on AEAD).
+	gcmKey := key16
+	gcm := goldenCryptFactory(t, "aesgcm", gcmKey)
+	aead, ok := gcm.(*aeadCrypt)
+	if !ok {
+		t.Fatalf("aesgcm is not *aeadCrypt")
+	}
+	if aead.NonceSize() != 12 {
+		t.Fatalf("aesgcm nonce size = %d, want 12", aead.NonceSize())
+	}
+	if aead.Overhead() != 16 {
+		t.Fatalf("aesgcm overhead = %d, want 16", aead.Overhead())
+	}
+	for _, length := range lengths {
+		plain := goldenPattern(length, byte(length+7))
+		nonce := goldenPattern(12, 9)
+		dst := make([]byte, 0, len(plain)+aead.Overhead())
+		sealed := aead.Seal(dst, nonce, plain, nil)
+		cipherPart := sealed[:len(plain)]
+		tagPart := sealed[len(plain):]
+		vectors = append(vectors, cryptVector{
+			Algo:      "aesgcm",
+			BlockSize: 16,
+			KeyHex:    goldenHex(gcmKey),
+			PlainHex:  goldenHex(plain),
+			CipherHex: goldenHex(cipherPart),
+			NonceHex:  goldenHex(nonce),
+			TagHex:    goldenHex(tagPart),
+		})
+		opened, err := aead.Open(nil, nonce, sealed, nil)
+		if err != nil || string(opened) != string(plain) {
+			t.Fatalf("aesgcm: Open(Seal(x)) != x for len=%d (err=%v)", length, err)
+		}
+	}
+	return vectors
+}
+
+// ---------------------------------------------------------------------------
+// rs.json
+// ---------------------------------------------------------------------------
+
+type rsVector struct {
+	DataShards   int      `json:"data_shards"`
+	ParityShards int      `json:"parity_shards"`
+	ShardSize    int      `json:"shard_size"`
+	DataHex      []string `json:"data_hex"`
+	ParityHex    []string `json:"parity_hex"`
+	Erased       []int    `json:"erased"`
+	RecoveredHex []string `json:"recovered_hex"`
+	MatrixHead   [][]int  `json:"matrix_head"`
+	MatrixRows   int      `json:"matrix_rows"`
+	VarLen       bool     `json:"var_len,omitempty"`
+	MaxLen       int      `json:"max_len,omitempty"`
+	ShardLens    []int    `json:"shard_lens,omitempty"`
+}
+
+// rsMatrixHead recovers the top rows of the encoding matrix through the public API: encode the
+// unit vector e_c and read parity[r][0] back. matrix[r][c] = parity(r) for e_c, by linearity.
+func rsMatrixHead(t *testing.T, enc reedsolomon.Encoder, dataShards, parityShards int) [][]int {
+	rows := 4
+	if parityShards < rows {
+		rows = parityShards
+	}
+	head := make([][]int, rows)
+	for r := range head {
+		head[r] = make([]int, dataShards)
+	}
+	for c := 0; c < dataShards; c++ {
+		shards := make([][]byte, dataShards+parityShards)
+		for i := range shards {
+			shards[i] = make([]byte, 1)
+		}
+		shards[c][0] = 1
+		if err := enc.Encode(shards); err != nil {
+			t.Fatalf("matrix probe encode: %v", err)
+		}
+		for r := 0; r < rows; r++ {
+			head[r][c] = int(shards[dataShards+r][0])
+		}
+	}
+	return head
+}
+
+func buildRSVector(t *testing.T, dataShards, parityShards, shardSize int, varLen bool) rsVector {
+	enc, err := reedsolomon.New(dataShards, parityShards)
+	if err != nil {
+		t.Fatalf("reedsolomon.New(%d,%d): %v", dataShards, parityShards, err)
+	}
+
+	lens := make([]int, dataShards)
+	for i := range lens {
+		lens[i] = shardSize
+	}
+	maxLen := shardSize
+	if varLen {
+		// Unequal shards: the FEC layer is responsible for zero-padding to maxLen before calling
+		// RS (PORTING-PLAN.md #41).
+		for i := range lens {
+			lens[i] = shardSize - i*(shardSize/4)/dataShards
+			if lens[i] < 1 {
+				lens[i] = 1
+			}
+		}
+		maxLen = shardSize
+	}
+
+	shards := make([][]byte, dataShards+parityShards)
+	data := make([][]byte, dataShards)
+	for i := 0; i < dataShards; i++ {
+		buf := goldenPattern(lens[i], byte(i+1))
+		if varLen {
+			padded := make([]byte, maxLen)
+			copy(padded, buf)
+			buf = padded
+		}
+		data[i] = buf
+		shards[i] = goldenClone(buf)
+	}
+	for i := dataShards; i < len(shards); i++ {
+		shards[i] = make([]byte, maxLen)
+	}
+	if err := enc.Encode(shards); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+
+	parity := make([]string, parityShards)
+	for i := 0; i < parityShards; i++ {
+		parity[i] = goldenHex(shards[dataShards+i])
+	}
+
+	// Erase the first min(parityShards, 2) data shards and recover them.
+	eraseCount := parityShards
+	if eraseCount > 2 {
+		eraseCount = 2
+	}
+	erased := make([]int, eraseCount)
+	for i := range erased {
+		erased[i] = i
+	}
+	for _, i := range erased {
+		shards[i] = nil
+	}
+	if err := enc.ReconstructData(shards); err != nil {
+		t.Fatalf("reconstruct: %v", err)
+	}
+	recovered := make([]string, len(erased))
+	for k, i := range erased {
+		recovered[k] = goldenHex(shards[i])
+		if string(shards[i]) != string(data[i]) {
+			t.Fatalf("recovered shard %d mismatch", i)
+		}
+	}
+
+	return rsVector{
+		DataShards:   dataShards,
+		ParityShards: parityShards,
+		ShardSize:    maxLen,
+		DataHex:      goldenHexAll(data),
+		ParityHex:    parity,
+		Erased:       erased,
+		RecoveredHex: recovered,
+		MatrixHead:   rsMatrixHead(t, enc, dataShards, parityShards),
+		MatrixRows:   min(4, parityShards),
+		VarLen:       varLen,
+		MaxLen:       maxLen,
+		ShardLens:    lens,
+	}
+}
+
+func goldenHexAll(items [][]byte) []string {
+	out := make([]string, len(items))
+	for i := range items {
+		out[i] = goldenHex(items[i])
+	}
+	return out
+}
+
+func buildRSVectors(t *testing.T) []rsVector {
+	return []rsVector{
+		buildRSVector(t, 3, 1, 128, false),
+		buildRSVector(t, 10, 3, 1024, false),
+		buildRSVector(t, 20, 10, 512, false),
+		buildRSVector(t, 128, 128, 64, false),
+		buildRSVector(t, 10, 3, 1024, true),
+	}
+}
+
+// ---------------------------------------------------------------------------
+// fec.json
+// ---------------------------------------------------------------------------
+
+type fecVector struct {
+	Kind              string   `json:"kind"`
+	DataShards        int      `json:"data_shards"`
+	ParityShards      int      `json:"parity_shards"`
+	HeaderOffset      int      `json:"header_offset"`
+	EncodeLatencyMs   int      `json:"encode_latency_ms,omitempty"`
+	PacketsHex        []string `json:"packets_hex,omitempty"`
+	ParityHex         []string `json:"parity_hex,omitempty"`
+	ExpectParityCount int      `json:"expect_parity_count,omitempty"`
+	Dropped           []int    `json:"dropped,omitempty"`
+	RecoveredHex      []string `json:"recovered_hex,omitempty"`
+	PacketHex         string   `json:"packet_hex,omitempty"`
+}
+
+const (
+	goldenFecDataShards   = 10
+	goldenFecParityShards = 3
+	goldenFecLatencyMs    = 500 // maxFECEncodeLatency, the value sess.go passes to encode()
+)
+
+// buildFecVectors drives the real fecEncoder/fecDecoder. Parity generation depends on wall-clock
+// continuity (encode() compares against rto), so ten calls must happen within maxFECEncodeLatency;
+// the assertion on the parity count makes a slow machine fail loudly instead of silently emitting
+// a vector without parity.
+func buildFecVectors(t *testing.T) []fecVector {
+	enc := newFECEncoder(goldenFecDataShards, goldenFecParityShards, 0)
+	if enc == nil {
+		t.Fatalf("newFECEncoder returned nil")
+	}
+
+	const payloadLen = 200
+	packets := make([][]byte, 0, goldenFecDataShards)
+	var parity [][]byte
+	for i := 0; i < goldenFecDataShards; i++ {
+		buf := make([]byte, fecHeaderSize+payloadLen)
+		copy(buf[fecHeaderSize:], goldenPattern(payloadLen, byte(i+1)))
+		ps := enc.encode(buf, goldenFecLatencyMs)
+		packets = append(packets, goldenClone(buf))
+		if i == goldenFecDataShards-1 {
+			for _, p := range ps {
+				parity = append(parity, goldenClone(p))
+			}
+		}
+	}
+	if len(parity) != goldenFecParityShards {
+		t.Fatalf("expected %d parity shards, got %d (slow machine or continuity check changed)",
+			goldenFecParityShards, len(parity))
+	}
+
+	// Sanity: FEC headers must be seqid 0..12 with typeData for 0..9 and typeParity for 10..12.
+	all := append(goldenCloneAll(packets), goldenCloneAll(parity)...)
+	for i, pkt := range all {
+		if got := binary.LittleEndian.Uint32(pkt[0:4]); got != uint32(i) {
+			t.Fatalf("packet %d: seqid = %d", i, got)
+		}
+		wantType := uint16(typeData)
+		if i >= goldenFecDataShards {
+			wantType = uint16(typeParity)
+		}
+		if got := binary.LittleEndian.Uint16(pkt[4:6]); got != wantType {
+			t.Fatalf("packet %d: type = 0x%x, want 0x%x", i, got, wantType)
+		}
+	}
+
+	// Decode with two data shards missing; 11 >= 10 shards are available, so recovery must succeed.
+	dropped := []int{0, 4}
+	dec := newFECDecoder(goldenFecDataShards, goldenFecParityShards)
+	if dec == nil {
+		t.Fatalf("newFECDecoder returned nil")
+	}
+	var recovered [][]byte
+	for i, pkt := range all {
+		if goldenContains(dropped, i) {
+			continue
+		}
+		for _, rec := range dec.decode(fecPacket(goldenClone(pkt))) {
+			recovered = append(recovered, goldenClone(rec))
+		}
+	}
+	if len(recovered) != len(dropped) {
+		t.Fatalf("recovered %d shards, want %d", len(recovered), len(dropped))
+	}
+	// Recovered payload must equal the original data packet minus its 6-byte FEC header.
+	for k, index := range dropped {
+		want := packets[index][fecHeaderSize:]
+		if string(recovered[k]) != string(want) {
+			t.Fatalf("recovered shard %d does not match the dropped data packet", index)
+		}
+	}
+
+	// OOB frame: 6-byte FEC header (seqid 0xffffffff, typeOOB) + 2-byte size + conv(4) + payload.
+	oobEnc := newFECEncoder(goldenFecDataShards, goldenFecParityShards, 0)
+	conv := []byte{0x01, 0x00, 0x00, 0x00}
+	oobPayload := goldenPattern(64, 0x5a)
+	oob := make([]byte, fecHeaderSize+len(conv)+len(oobPayload))
+	copy(oob[fecHeaderSize:], conv)
+	copy(oob[fecHeaderSize+len(conv):], oobPayload)
+	oobEnc.encodeOOB(oob)
+	if got := binary.LittleEndian.Uint32(oob[0:4]); got != 0xffffffff {
+		t.Fatalf("oob seqid = 0x%x", got)
+	}
+	if got := binary.LittleEndian.Uint16(oob[4:6]); got != uint16(typeOOB) {
+		t.Fatalf("oob type = 0x%x", got)
+	}
+
+	return []fecVector{
+		{
+			Kind:              "encode",
+			DataShards:        goldenFecDataShards,
+			ParityShards:      goldenFecParityShards,
+			HeaderOffset:      0,
+			EncodeLatencyMs:   goldenFecLatencyMs,
+			PacketsHex:        goldenHexAll(packets),
+			ParityHex:         goldenHexAll(parity),
+			ExpectParityCount: len(parity),
+		},
+		{
+			Kind:            "decode",
+			DataShards:      goldenFecDataShards,
+			ParityShards:    goldenFecParityShards,
+			HeaderOffset:    0,
+			EncodeLatencyMs: goldenFecLatencyMs,
+			PacketsHex:      goldenHexAll(all),
+			Dropped:         dropped,
+			RecoveredHex:    goldenHexAll(recovered),
+		},
+		{
+			Kind:         "oob",
+			DataShards:   goldenFecDataShards,
+			ParityShards: goldenFecParityShards,
+			HeaderOffset: 0,
+			PacketHex:    goldenHex(oob),
+		},
+	}
+}
+
+func goldenCloneAll(items [][]byte) [][]byte {
+	out := make([][]byte, len(items))
+	for i := range items {
+		out[i] = goldenClone(items[i])
+	}
+	return out
+}
+
+func goldenContains(haystack []int, needle int) bool {
+	for _, v := range haystack {
+		if v == needle {
+			return true
+		}
+	}
+	return false
+}
+
+// ---------------------------------------------------------------------------
+// kcp.json
+// ---------------------------------------------------------------------------
+
+type kcpParams struct {
+	Conv     uint32 `json:"conv"`
+	Mtu      int    `json:"mtu"`
+	SndWnd   int    `json:"snd_wnd"`
+	RcvWnd   int    `json:"rcv_wnd"`
+	NoDelay  int    `json:"nodelay"`
+	Interval int    `json:"interval"`
+	Resend   int    `json:"resend"`
+	Nc       int    `json:"nc"`
+	WaitSnd  int    `json:"wait_snd"`
+}
+
+type kcpSegment struct {
+	Cmd      int    `json:"cmd"`
+	Frg      int    `json:"frg"`
+	Sn       uint32 `json:"sn"`
+	Una      uint32 `json:"una"`
+	Len      int    `json:"len"`
+	BytesHex string `json:"bytes_hex"`
+	TsMasked bool   `json:"ts_masked"`
+}
+
+type kcpVector struct {
+	Stream   bool         `json:"stream"`
+	Params   kcpParams    `json:"params"`
+	Segments []kcpSegment `json:"segments"`
+}
+
+// buildKcpVector captures the first flush of a fresh KCP instance. The ts field is zeroed because
+// it comes from the wall clock; the C++ side masks the same four bytes before comparing.
+func buildKcpVector(t *testing.T, stream bool) kcpVector {
+	const conv = 1
+	const payloadLen = 3000 // > mss (1376) so frg splitting is exercised
+
+	var raw [][]byte
+	k := NewKCP(conv, func(buf []byte, size int) {
+		if size < IKCP_OVERHEAD {
+			return
+		}
+		raw = append(raw, goldenClone(buf[:size]))
+	})
+	k.SetMtu(IKCP_MTU_DEF)
+	k.NoDelay(1, 10, 2, 1)
+	k.WndSize(32, 32)
+	if stream {
+		k.stream = 1
+	}
+	k.Send(goldenPattern(payloadLen, 0x42))
+	if k.WaitSnd() == 0 {
+		t.Fatalf("Send produced no queued data")
+	}
+	k.Update()
+	if len(raw) == 0 {
+		t.Fatalf("first Update() produced no segments")
+	}
+
+	segments := make([]kcpSegment, 0, len(raw))
+	for _, seg := range raw {
+		if len(seg) < IKCP_OVERHEAD {
+			t.Fatalf("segment shorter than IKCP_OVERHEAD")
+		}
+		// Layout: conv(0:4) cmd(4) frg(5) wnd(6:8) ts(8:12) sn(12:16) una(16:20) len(20:24)
+		length := int(binary.LittleEndian.Uint32(seg[20:24]))
+		if len(seg) != IKCP_OVERHEAD+length {
+			t.Fatalf("segment length field %d disagrees with buffer %d", length, len(seg))
+		}
+		masked := goldenClone(seg)
+		for i := 8; i < 12; i++ {
+			masked[i] = 0
+		}
+		segments = append(segments, kcpSegment{
+			Cmd:      int(seg[4]),
+			Frg:      int(seg[5]),
+			Sn:       binary.LittleEndian.Uint32(seg[12:16]),
+			Una:      binary.LittleEndian.Uint32(seg[16:20]),
+			Len:      length,
+			BytesHex: goldenHex(masked),
+			TsMasked: true,
+		})
+	}
+
+	return kcpVector{
+		Stream: stream,
+		Params: kcpParams{
+			Conv:     conv,
+			Mtu:      IKCP_MTU_DEF,
+			SndWnd:   IKCP_WND_SND,
+			RcvWnd:   IKCP_WND_RCV,
+			NoDelay:  1,
+			Interval: 10,
+			Resend:   2,
+			Nc:       1,
+			WaitSnd:  k.WaitSnd(),
+		},
+		Segments: segments,
+	}
+}
+
+// ---------------------------------------------------------------------------
+// frame.json
+// ---------------------------------------------------------------------------
+
+type frameVector struct {
+	Crypt            string `json:"crypt"`
+	Fec              bool   `json:"fec"`
+	DataShards       int    `json:"data_shards"`
+	ParityShards     int    `json:"parity_shards"`
+	HeaderSize       int    `json:"header_size"`
+	NonceHex         string `json:"nonce_hex,omitempty"`
+	Crc32Le          string `json:"crc32_le,omitempty"`
+	KcpSegHex        string `json:"kcp_seg_hex"`
+	EncryptedBlobHex string `json:"encrypted_blob_hex"`
+}
+
+// buildFrameVector assembles one wire packet exactly as postProcess does:
+//
+//	FEC encoding  -> [crypto header][FEC header 6][size 2][KCP segment]
+//	CFB           -> fill nonce(16), crc32 over buf[20:], write LE crc at [16:20], encrypt whole buf
+//	AES-GCM       -> fill nonce(12) at [0:12], Seal(dst=buf[:12], nonce, plaintext=buf[12:])
+//
+// The nonce is fixed so the output is reproducible; in a live session it is random.
+func buildFrameVector(t *testing.T, cryptName string, fec bool, seg []byte, nonce []byte) frameVector {
+	encHeader := 0
+	switch cryptName {
+	case "none":
+		encHeader = 0
+	case "cfb":
+		encHeader = cryptHeaderSize // 20 = nonce 16 + crc 4
+	case "aesgcm":
+		encHeader = 12
+	default:
+		t.Fatalf("unknown crypt %q", cryptName)
+	}
+	fecSize := 0
+	if fec {
+		fecSize = fecHeaderSizePlus2
+	}
+	headerSize := encHeader + fecSize
+
+	total := headerSize + len(seg)
+	// Extra capacity for the AEAD tag: Seal appends it to dst.
+	buf := make([]byte, total, total+16)
+	copy(buf[headerSize:], seg)
+
+	if fec {
+		enc := newFECEncoder(goldenFecDataShards, goldenFecParityShards, encHeader)
+		if enc == nil {
+			t.Fatalf("newFECEncoder returned nil")
+		}
+		enc.encode(buf, goldenFecLatencyMs)
+		// encode() writes the FEC header at [encHeader:encHeader+6] and the size field at
+		// [encHeader+6:encHeader+8]; the payload has already been placed at [headerSize:].
+		if got := binary.LittleEndian.Uint16(buf[encHeader+4:]); got != uint16(typeData) {
+			t.Fatalf("frame FEC type = 0x%x", got)
+		}
+	}
+
+	vector := frameVector{
+		Crypt:        cryptName,
+		Fec:          fec,
+		DataShards:   goldenFecDataShards,
+		ParityShards: goldenFecParityShards,
+		HeaderSize:   headerSize,
+		KcpSegHex:    goldenHex(seg),
+	}
+	if !fec {
+		vector.DataShards = 0
+		vector.ParityShards = 0
+	}
+
+	switch cryptName {
+	case "none":
+		vector.EncryptedBlobHex = goldenHex(buf)
+	case "cfb":
+		block, err := NewAESBlockCrypt(goldenPattern(16, 0x11))
+		if err != nil {
+			t.Fatalf("AES factory: %v", err)
+		}
+		if len(nonce) != cryptHeaderSize-4 {
+			t.Fatalf("cfb nonce must be %d bytes", cryptHeaderSize-4)
+		}
+		copy(buf[0:cryptHeaderSize-4], nonce)
+		checksum := crc32.ChecksumIEEE(buf[cryptHeaderSize:])
+		binary.LittleEndian.PutUint32(buf[cryptHeaderSize-4:], checksum)
+		block.Encrypt(buf, buf)
+		vector.NonceHex = goldenHex(nonce)
+		vector.Crc32Le = fmt.Sprintf("0x%08x", checksum)
+		vector.EncryptedBlobHex = goldenHex(buf)
+	case "aesgcm":
+		gcmCrypt, err := NewAESGCMCrypt(goldenPattern(16, 0x11))
+		if err != nil {
+			t.Fatalf("AESGCM factory: %v", err)
+		}
+		aead := gcmCrypt.(*aeadCrypt)
+		if len(nonce) != aead.NonceSize() {
+			t.Fatalf("gcm nonce must be %d bytes", aead.NonceSize())
+		}
+		copy(buf[0:aead.NonceSize()], nonce)
+		sealed := aead.Seal(buf[:aead.NonceSize()], nonce, buf[aead.NonceSize():], nil)
+		vector.NonceHex = goldenHex(nonce)
+		vector.EncryptedBlobHex = goldenHex(sealed)
+	}
+	return vector
+}
+
+func buildFrameVectors(t *testing.T) []frameVector {
+	kcpVectors := buildKcpVector(t, false)
+	seg := mustHex(t, kcpVectors.Segments[0].BytesHex)
+
+	configs := []struct {
+		crypt string
+		fec   bool
+	}{
+		{"none", false},
+		{"none", true},
+		{"cfb", false},
+		{"cfb", true},
+		{"aesgcm", false},
+		{"aesgcm", true},
+	}
+
+	var vectors []frameVector
+	for _, cfg := range configs {
+		nonceLen := 0
+		switch cfg.crypt {
+		case "cfb":
+			nonceLen = cryptHeaderSize - 4
+		case "aesgcm":
+			nonceLen = 12
+		}
+		nonce := goldenPattern(nonceLen, 0x33)
+		vectors = append(vectors, buildFrameVector(t, cfg.crypt, cfg.fec, seg, nonce))
+	}
+	return vectors
+}
+
+func mustHex(t *testing.T, s string) []byte {
+	t.Helper()
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		t.Fatalf("bad hex: %v", err)
+	}
+	return b
+}
+
+// ---------------------------------------------------------------------------
+
+func TestEmitGoldenVectors(t *testing.T) {
+	dir := goldenOutDir(t)
+
+	goldenWrite(t, dir, "crypt.json", buildCryptVectors(t))
+	goldenWrite(t, dir, "rs.json", buildRSVectors(t))
+	goldenWrite(t, dir, "fec.json", buildFecVectors(t))
+	goldenWrite(t, dir, "kcp.json", []kcpVector{
+		buildKcpVector(t, false),
+		buildKcpVector(t, true),
+	})
+	goldenWrite(t, dir, "frame.json", buildFrameVectors(t))
+}

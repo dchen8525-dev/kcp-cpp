@@ -1,0 +1,9 @@
+# Google C++ Style, with deviation D8: line width 80 -> 100.
+# Rationale (PORTING-PLAN.md D8): crypto T-tables, hex golden vectors and wire
+# layout comments are unreadable at 80 columns.
+BasedOnStyle: Google
+ColumnLimit: 100
+Standard: c++17
+DerivePointerAlignment: false
+PointerAlignment: Left
+IncludeBlocks: Preserve

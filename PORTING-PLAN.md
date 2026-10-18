@@ -1,0 +1,724 @@
+# kcp-cpp 移植计划 v5.4（参考 xtaci/kcp-go v5）
+
+> 状态：待审核（v5.4，累计 20 轮对抗分析（75 条）+ 命名合规审计 + 源码逐行核验 + 用户决策）
+> 目标：将 D:\work\kcp-go（Go）完整移植为 C++17 库，输出到 D:\work\kcp-cpp，零第三方依赖。
+> 已确认决策：① 加密层自包含实现；② Reed-Solomon 自实现；③ 验收含跨语言互通；
+> ④ **定位 = 全量独立库**（含 session 层，与 kcp-proxy-cpp 解耦，集成另行议）；
+> ⑤ **v1 = Windows + Linux 双平台**（不是仅 Windows，工期已含）；
+> ⑥ **AES = AES-NI intrinsics + T 表回退**（cpuid 运行时检测；见 §3 决策表）；
+> ⑦ **API 命名 = Google C++ Style**（函数 CamelCase、类型 CamelCase 无下划线、成员 snake_case + 尾下划线、常量 `k`+CamelCase；I/O 家族与廉价存取器按 Google 明文例外保持 snake_case；**v5.4 已修正 v5.2 把"函数 snake_case"误标为 Google 的错误**；映射表见 §3.3）。
+> 环境：Go 1.27.2 @ `C:\Program Files\Go\bin\go.exe`（不在 PATH，脚本用绝对路径）；MSVC `/W4` + GCC/Clang `-Wall -Wextra`；Windows x64 / Linux x64。
+
+## 移植总原则（#36）
+
+> **除并发原语与资源管理外，一律照抄 Go 行为（wire 格式、错误语义、边界判定、默认值全部一致）；并发与资源管理按 C++ 惯用法重写，并在 §3 逐条记录差异。**
+
+理由：互通要求的是字节级与行为级一致，任何"顺手优化"都可能变成不可见的分叉。
+
+## v4 → v5 修订摘要（第 11~15 轮，攻击面：运行时段语义 / FEC 恢复链 / 加密边角 / 测试可执行性）
+
+| 轮 | 编号 | 修订 | 依据 |
+|---|---|---|---|
+| 11 | 37 | 新增 **§3.6 Read/Write 运行时段语义**：Read 三路径（bufptr 残留 / DMA 直读 / recvbuf 中转）+ **消息边界语义**（返回一条消息而非填满 b） | sess.go:296-334 |
+| 11 | 38 | output 回调补**非阻塞投递 + 队列满则丢 + recycle，靠 KCP 重传**语义 | sess.go:229-245 |
+| 11 | 39 | **写死 `writeDelay` 默认 false**（Go 零值）→ 默认 Write 立即 `flush(FULL)`；`SetWriteDelay(true)` 才开聚合 | sess.go:143,417,525 |
+| 11 | 40 | **撤回 v3 #3"AEAD MTU quirk"误判**：`SetMtu` 有双重减头 `min(mtuLimit,mtu) - headerSize - aead.Overhead()`，构造路径同样走（sess.go:248）→ 包不超限。改写为 §3.7 SetMtu 契约 | sess.go:248,537-547 |
+| 12 | 41 | **RS 补齐契约**：解码前全部 shard 补齐到 maxlen + **尾部清零**，仅缺失的数据分片（k<dataShards）分配空 buffer。P3 接口改为"调用方保证等长"，P4 负责补齐；P3 测试增变长场景 | fec.go:278-290 |
+| 12 | 42 | recovered 缓冲**所有权转移**：成功归调用者、失败自回收。C++ 用 `vector<unique_ptr<Buffer>>` | fec.go:293-307 |
+| 13 | 43 | **CFB 残字节纯 XOR 语义**：尾部不足一块只 XOR、不更新反馈寄存器、不再次加密；encrypt16 的宽切片 `dst[base:]` 是 Go slice 写法，等价 16B 块推进，直译必错 | crypt.go:421,466-501 |
+| 13 | 44 | **BlockCrypt 接口分裂**：AEAD 的 `Encrypt/Decrypt` 是 panic 空操作，统一虚接口假设错误 → 拆 `BlockCrypt`(CFB) + `AeadCrypt`(Seal/Open) 双接口（v5.4 去 `I` 前缀） | crypt.go:74-80 |
+| 13 | 45 | 常量值钉死：`initialVector` / `saltxor` 具体字节 | crypt.go:50-51 |
+| 13 | 46 | AEAD Seal：容量不足 panic（"increase MTU size"）、AAD=nil、每包 fillRand nonce（CFB 16B / GCM 12B） | crypt.go:82-87; sess.go:706-737 |
+| 14 | 47 | SetDSCP 平台差异记录：Go 走 x/net/ipv4+ipv6，`dscp<<2` 进 TOS；Windows 仅部分支持，Linux 走 `IP_TOS`/`IPV6_TCLASS` | sess.go:586-618 |
+| 14 | 48 | `SetReadBuffer/SetWriteBuffer` 对 Listener 接受的 session 返回 `errInvalidOperation`（`s.l == nil` 守卫） | sess.go:621-642 |
+| 15 | 49 | 新增 **§6.2 丢包中继规格**（位置/模型/延迟注入/对照方式），P5 门禁否则不可判定 | — |
+| 15 | 50 | 新增 **§6.3 性能基线测量方法**（指标/流数/样本/统计量），P6 门禁否则不可判定 | — |
+| 15 | 51 | snmp 计数器（FECRecovered/FECErrs/FECFullShardSet）升格为**测试断言手段** | fec.go:276,301,310 |
+| 15 | 52 | IKCP_OVERHEAD 值、bufferpool mtuLimit 粒度、discardShards/shardHeap.Has 去重等边角补入 §4.7 | 待查证项已列 |
+
+工期（v5 当时）：P2 1.5→2d，P3 1.5→2d，P4 1→1.5d，P5 3→3.5d，P6 4→4.5d，总量 18~20d。**已被 v5.1 的 20~22.5d 取代，以 §7 为准。**
+
+### v5.1/v5.2 决策落地（用户拍板）
+
+- **v5.1**：定位 = 全量独立库；双平台（platform/socket + 双熵源 + 双 preset，P0/P6 门禁双平台）；AES-NI + T 表回退（P2 门禁两条路径交叉互验）；工期 20~22.5d；新增 R16 平台分叉风险。
+- **v5.2**：命名 = Google C++ Style（决策⑦）。§3.3 增补 Go→C++ 映射总表（session/listener/包级/crypt 工厂/KCP 内部/常量共 40+ 条）；**新增系统调用名遮蔽硬规则**（成员 read/write/close/recv/send/shutdown 与 POSIX 同名 → session/listener 只准调 platform 层封装，从架构上消灭遮蔽）；§3.4 错误码改 `k`+PascalCase 枚举 + `error_category`；§3.6/§3.7/§3.8/§4.6/§4.7 全部同步为 Google 风格命名。**（其中"函数 snake_case"是对 Google Naming 的误读——Google 函数规则是 CamelCase，仅存取器可小写；v5.4 已全面纠正，见下方修订摘要）**
+
+### v5.2 → v5.3 修订摘要（第 16~20 轮，攻击面：修复自身引入的矛盾 / 未验证源码区 / 验收可判定性 / 文档完整性）
+
+本轮 **4 条致命**，其中 1 条从 v1 一直错到 v5.2（段头重复计 conv），2 条是**编造/记错的 API**。
+
+| 轮 | 编号 | 修订 | 依据 |
+|---|---|---|---|
+| 16 | 53 | 常量命名**二分规则**：`IKCP_*`→`kIcp`+PascalCase，sess/crypt/fec 常量→`k`+PascalCase（消除 v5.2 的 `kIcp*` vs `kRtoDef` 自相矛盾） | 自查 |
+| 16 | 54 | 新增 **§3.4.1 偏离登记表 D1~D7**（总原则 #36 的强制配套：任何不照抄 Go 的点必须登记理由） | Go panic→错误码 |
+| 16 | 55 | 工期行加"以 §7 为准"消歧（18~20d 与 20~22.5d 曾并存） | — |
+| 16 | 56 | 映射表格式统一（`KCP::input`→`input`） | — |
+| 17 | **57** | **【致命】段头定义错**：`kOverhead=24` **已含 conv**（kcp.go:58 注释 + mss=mtu−24，kcp.go:198）；旧文"conv4 + 24B 段头"重复计 conv，会让 `len` 字段与 `kcp.json` 全错 | kcp.go:58,198 |
+| 17 | **58** | **【致命】crypt 工厂名错+漏项**：实名 `NewAESGCMCrypt`（非 `NewAESGCMBlockCrypt`）；**补漏 `NewAEADCrypt`**（包装外部 AEAD，crypt.go:103） | crypt.go:103,113,273 |
+| 17 | **74** | **【致命】`DialWithOptionsConn` 系编造**，真实为 `NewConn/NewConn2/NewConn3/NewConn4`（sess.go:1511-1528）；`DialWithOptions` 无 key 参数（key 在 BlockCrypt 内） | sess.go:1511-1528 |
+| 17 | 59 | §3.3 补 **API 全集核对表**（UDPSession 29 / Listener 11 / 包级 8 / 工厂 13，全部 grep 实测）；此后 API 条目必须附源码行号 | 源码 grep |
+| 17 | 60 | **OOB 帧完整规格**：布局 `FEC头8‖conv4‖payload`、接收端 payload 偏移 12、`oob_max_size = kcp.mtu − 4`、复用 FEC 头但不进 FEC 编解码、超长/队列满/关闭三态 | sess.go:872-935,1100 |
+| 17 | 61 | 分流表标注**作用于解密后明文**（CFB 下 `data[4:6]` 是密文，对着密文找 0xf1 永远找不到） | §4.1 顺序 |
+| 18 | 62 | 删除悬空编号 `E2`，展开为具体描述 | 文档重写导致编号丢失 |
+| 18 | 63 | 补**核心签名**（read/write/write_buffers/close/set_mtu/dial_with_options/listen_with_options/accept）+ `set_mtu` 返回值语义反转说明 | — |
+| 18 | 64 | §2 目录结构补 `lossy_relay.{hpp,cpp}` / `json_reader.{hpp,cpp}` | §6.2/§5.6 要求 |
+| 18 | 65 | 新增 **§0.1 术语表**（KCP 段/FEC 头/shard/shard set/UDP 包/消息） | 文档内混用 |
+| 18 | 66 | `fec.json` 字段 `rto_ms`→`encode_latency_ms`（原名误导为 RTO） | — |
+| 19 | 67 | 互通矩阵 **8B 块 CFB 分支（TEA/XTEA）覆盖缺口显式记录**为已知且接受（理由：与 16B 共用实现，仅块长参数不同） | 矩阵仅 4 种加密 |
+| 19 | 68 | §6.3 补 **Go 基线参数必须与 C++ 完全一致**（不得依赖 kcp-go 默认值）+ 阈值来源说明 + 双平台各测 | 基线不可比 |
+| 19 | 69 | P5 30% 丢包场景加 **120s 时限 + dead_link 处置规则**（超时不得无限等待） | RTO 退避/假失败 |
+| 19 | 70 | P6 并发门禁补 **FEC(0,0)** 组（裸路径并发未验） | — |
+| 20 | 71 | §4.2 补**六种配置的 mtu/mss 计算表**（原文只举 GCM 一例） | — |
+| 20 | 72 | 编号断层说明：**#1~#18 的清单在 v3 重写时未保留**，正文不再引用这些编号；现引用范围 #19~#74 均有定义 | 文档完整性 |
+| 20 | 73 | 偏离登记表兼作"Go 事实 vs 工程折中"索引，读者可一眼区分 | — |
+| 20 | 75 | `listen_with_options` 返回类型改为 `std::unique_ptr<Listener>`（内含线程+socket，值返回不安全）；session 持 raw `Listener*` 防循环引用 | §3.1 所有权 |
+
+### v5.3 → v5.4 修订摘要（第 21 轮，攻击面：**命名合规性**——拿 Google C++ Style Guide 的 Naming 各节逐条核 v5.3）
+
+结论：类型/成员/常量/命名空间基本合规，**但"函数一律 snake_case"是 Chromium/LLVM 惯例，不是 Google**（Google 函数须 CamelCase，仅两类例外可小写）。这是 v5.2 的误读，影响面覆盖全部签名，故单开一轮全量纠正。
+
+| 轮 | 编号 | 修订 | 依据 |
+|---|---|---|---|
+| 21 | **76** | **【致命·风格】函数名按 Google 改 CamelCase**：动作/设置/工厂/包级函数全部 `Send`/`SetNoDelay`/`DialWithOptions`/`NewAesGcmCrypt`/`PeekSize`；仅两类保留 snake_case——(a) I/O 家族 `read`/`write`/`write_buffers`/`close`（"模仿既有 C++/POSIX 实体"例外），(b) 11 个廉价取值存取器 `conv()/rto()/srtt()/srtt_var()/local_addr()/remote_addr()/addr()/oob_max_size()/is_aead()/wait_snd()/mtu()`（"存取器可命名如变量"例外） | Google C++ Style: Function Names |
+| 21 | 77 | **类型名收干净**：`KCP`→`Kcp`、`UDPSession`→`UdpSession`、`IBlockCrypt`→`BlockCrypt`、`IAeadCrypt`→`AeadCrypt`、`const_buffer`→`ConstBuffer`（Google camel case 缩写只大写首字母；匈牙利式 `I` 接口前缀不鼓励） | Google: Type Names / General Naming Rules |
+| 21 | 78 | **常量去 `kIcp` 双前缀**：`kIcpOverhead`→`kOverhead`、`kIcpMtuDef`→`kMtuDef`、`kIcpRtoDef`→`kRtoDef`。`namespace kcp` 已限定作用域，再加 `Icp` 前缀属匈牙利记法；**原 #53 的"二分规则"作废** | Google: Constant Names |
+| 21 | 79 | **文件规则改全套 Google**：`.hpp`/`.cpp`→`.h`/`.cc`；`session.h`→`udp_session.h`（Google 要求文件名具体）；`detail/`→`internal/`（Google 代码库惯例，`detail` 是 Boost/STL 惯例）；**补 `#define` guard 规则** `KCP_<PATH>_<FILE>_H_`，禁用 `#pragma once` | Google: File Names / The #define Guard |
+| 21 | 80 | **原"系统调用遮蔽硬规则"重写**：函数改 CamelCase 后 `Read/Write/Close` 与 POSIX 大小写不同、不再遮蔽，遮蔽面从 6 个缩到 3 个（仅保留小写的 `read`/`write`/`close`）；platform 层保留，但立论从"防遮蔽"改为"跨平台收敛 + 错误码归一" | 自查 |
+| 21 | 81 | **修三处内部矛盾**：§3 决策表 `int Read(...)` 与 §3.3 `read` 冲突；§3.1 `Errc::closed_pipe` 与 §3.4 `kClosedPipe` 冲突；`Errc` 与 `ErrorCode` 两名并存 → 统一 `ErrorCode` + `k`+CamelCase | 自查 |
+| 21 | 82 | 新增偏离 **D8：行宽 80 → 100**。Google 硬性要求 80 列，但密码学 T 表、hex 黄金向量、wire 布局注释在 80 列内不可读；`.clang-format` 用 `BasedOnStyle: Google, ColumnLimit: 100` | Google: Line Length |
+| 21 | 83 | P0 增 `.clang-format` + `clang-format --dry-run --Werror` 门禁 + guard 命名检查；`json_reader` / `lossy_relay` 扩展名同步 | — |
+| 21 | 84 | §3.3 增**"包"命名四层说明**（C++ 无包概念）：命名空间 `kcp` / `kcp::internal`、目录 `include/kcp/internal/`、文件名+扩展名、include 写法 `#include "kcp/udp_session.h"` | 用户提问 |
+
+---
+
+## 0.1 术语表（#65，消除"段/帧/包/shard/消息"混用）
+
+| 术语 | 定义 | 字节量级 |
+|---|---|---|
+| **KCP 段**（segment） | KCP 协议单位：**24B 段头**（含 conv）+ payload | 24 ~ mtu |
+| **FEC 头**（FEC header） | `seqid(4) + type(2) + size(2)`，即 `kFecHeaderSizePlus2=8` | 8 |
+| **shard**（分片） | FEC 编解码单元，data shard 或 parity shard | ≤ ~1400 |
+| **shard set**（分片组） | 同一 `shardId = seqid / shardSize` 下的 data+parity 集合 | dataShards+parityShards 个 |
+| **UDP 包**（packet）/ **帧**（frame） | 最终上线的字节序列 = 加密头 + FEC 头 + KCP 段（依配置，§4.2）。本文件"帧"与"UDP 包"同义；"OOB 帧/FEC 帧"特指其 type 字段值 | ≤ 1500 |
+| **消息**（message） | `write()` 一次写入、`read()` 一次读出的逻辑单元；可被 `frg` 拆成多个 KCP 段 | 任意（受窗口限制） |
+
+---
+
+## 1. 范围
+
+| Go 源文件 | 行数 | C++ 输出 | 复杂度 |
+|---|---|---|---|
+| kcp.go | 1147 | kcp.h / kcp.cc | 高 |
+| sess.go | 1534 | udp_session.h / udp_session.cc（+ listener.h/.cc） | 高 |
+| crypt.go | 696 | crypt.h + internal/{aes,gcm,salsa20,tea,cfb} | 高 |
+| fec.go | 512 | fec.h / fec.cc | 中 |
+| ringbuffer.go | 244 | internal/ringbuffer.h | 中 |
+| snmp.go | 216 | snmp.h / snmp.cc | 低 |
+| timedsched.go | 184 | internal/timedsched.h/.cc | 中 |
+| entropy.go | 171 | internal/entropy.h | 低 |
+| autotune.go | 157 | P8 可选 | 低 |
+| bufferpool.go | 79 | internal/bufferpool.h | 低 |
+| readloop.go / tx.go | 126 | 并入 udp_session.cc | 中 |
+
+**不移植**：批量收发（`recvmmsg/sendmmsg`，见 R7 性能差距）；3DES/Blowfish/CAST5/Twofish/SM4；`x/time/rate`（自实现令牌桶）。
+
+**自实现密码学范围（对照 crypt.go import 面核实，#52）**：pbkdf2 / salsa20 / tea / xtea / sha1 / crc32 自实现；aes / aesgcm 自实现；sm4 / blowfish / cast5 / twofish 留占位工厂报 `unsupported_cipher`。
+
+---
+
+## 2. 目录结构
+
+```
+D:\work\kcp-cpp\
+├── CMakeLists.txt / CMakePresets.json / .clang-format / build.bat / build.sh
+├── PORTING-PLAN.md / LICENSE / README.md / .gitignore
+├── include/kcp/{kcp,fec,crypt,reedsolomon,udp_session,listener,snmp}.h
+├── include/kcp/internal/{primitives,entropy,aes,gcm,salsa20,tea,cfb,bufferpool,
+│                        ringbuffer,blocking_queue,timedsched}.h
+├── include/kcp/platform/{socket,entropy_backend}.h   # 决策⑤：WinSock2/POSIX 双实现
+├── src/...                      # 与 include 同名 .cc，文件头注释含 MIT 出处
+├── tests/                       # 集成测试串行执行；端口 = base + (pid % 1000)
+│   ├── lossy_relay.{h,cc}       # 丢包中继（§6.2：均匀 + Gilbert-Elliott）
+│   └── json_reader.{h,cc}       # 黄金向量扁平解析器（§5.6）
+├── tools\
+│   ├── golden\                  # 黄金向量生成器
+│   │   ├── go.mod  main.go  gen.bat
+│   │   └── out\{crypt,rs,fec,kcp,frame}.json
+│   └── interop\
+│       ├── go.mod               # replace → D:/work/kcp-go（与 golden 相同）
+│       ├── goecho_server.go     # Go echo 服务端（互通 + 性能基线）
+│       ├── goecho_client.go     # Go echo 客户端（反向互通 + 基线对拍）
+│       ├── run_matrix.py        # 16 格编排：2 方向 × 4 加密 × 2 FEC
+│       └── dump_packet.py       # 互通失败定位：抓首包 hexdump + 二进制 diff
+└── examples\{echo_server,echo_client}.cc
+```
+
+**文件与 include 规则（Google）**：文件名全小写 + 下划线，**头 `.h` / 源 `.cc`**；每个头文件用 `#define` guard（格式 `<PROJECT>_<PATH>_<FILE>_H_`：`KCP_UDP_SESSION_H_`、`KCP_INTERNAL_AES_H_`、`KCP_PLATFORM_SOCKET_H_`），**禁用 `#pragma once`**；include 一律从项目根写 `#include "kcp/udp_session.h"`，内部头写 `#include "kcp/internal/aes.h"`；include 顺序 = 对应头 → C 系统 → C++ 标准库 → 本项目 → 第三方（本项目零第三方，此级恒空）。
+
+**平台抽象（决策⑤）**：`platform/socket.h` 统一 `sys_socket/sys_close/sys_sendto/sys_recvfrom/sys_setsockopt/sys_shutdown` 与 `last_error()`（内部映射 `WSAGetLastError`/`errno`）；`platform/entropy_backend.h` 统一 `FillRand`（Windows `BCryptGenRandom` / Linux `getrandom(2)`，均无需链接第三方库——Linux 走 glibc）。CMake：Windows 链 `ws2_32`；Linux 链 `Threads::Threads`。
+
+**网络策略（#30）**：所有回环与互通测试走 `127.0.0.1` 双进程，不使用外部地址，因此**不涉及 Windows 防火墙放行**。示例程序支持 `--addr` 覆盖以便用户手工测真实链路。
+
+---
+
+## 3. 设计决策
+
+| 决策点 | 方案 |
+|---|---|
+| 错误处理 | 核心层返回 `ErrorCode` 不抛异常；会话层 `int read(void*, size_t, std::error_code* = nullptr)` |
+| 时间 | `steady_clock`；KCP 内部 uint32 毫秒 + `itimediff` |
+| 命名（决策⑦） | **Google C++ Style**（v5.4 修正）。函数 CamelCase：`Send`/`SetNoDelay`/`DialWithOptions`/`NewAesGcmCrypt`/`PeekSize`；**两类例外保持 snake_case**——① I/O 家族 `read`/`write`/`write_buffers`/`close`，② 11 个廉价取值存取器（`conv()`/`rto()`/`srtt()`/`srtt_var()`/`local_addr()`/`remote_addr()`/`addr()`/`oob_max_size()`/`is_aead()`/`wait_snd()`/`mtu()`）。类型 CamelCase 无下划线、**缩写只大写首字母**、接口无 `I` 前缀：`Kcp`/`UdpSession`/`FecEncoder`/`BlockCrypt`/`AeadCrypt`/`ConstBuffer`。成员 snake_case + 尾下划线（`snd_wnd_`/`mu_`）；wire 结构体字段 snake_case 无后缀（`cmd`/`frg`/`sn`）；常量与枚举值 `k`+CamelCase（`kMtuDef`/`kOverhead`/`kTimeout`），**无 `kIcp` 前缀**；命名空间 `kcp` / `kcp::internal`；文件 `.h`/`.cc` + `#define` guard。详见 §3.3 |
+| 格式化 | `.clang-format`：`BasedOnStyle: Google`，**`ColumnLimit: 100`（偏离 D8，Google 为 80 列）**；`clang-format --dry-run --Werror` 入门禁 |
+| 警告 | MSVC `/W4` + GCC/Clang `-Wall -Wextra`；移植代码允许带原因注释的 pragma 抑制 |
+| 平台（决策⑤） | **Windows + Linux 双平台**：socket 层双实现（WinSock2 / POSIX），`std::thread`+condvar 跨平台，熵源双后端（BCryptGenRandom / getrandom）；CMake 双 preset |
+| AES（决策⑥） | **AES-NI intrinsics + T 表回退**：cpuid 运行时检测；AES-NI 路径比 T 表快 2~3 倍且指令级恒定时间；无 AES-NI 的老 CPU 回退 T 表（README 记录该路径的 cache-timing 差距，R5） |
+
+### 3.1 所有权与生命周期（#19/#20/#21）
+
+```
+DialWithOptions / Listener::AcceptKcp → std::shared_ptr<UdpSession>
+Listener::sessions_        → unordered_map<string /*源地址*/, shared_ptr<UdpSession>>
+TimedSched 延迟回调        → std::weak_ptr<UdpSession>（回调内 lock() 失败即跳过）
+```
+
+`close()` 契约（跟随 Go + C++ 必需修正）：
+1. **幂等但重复调用返回错误**：首次 `close()` 置 `closed_` 并返回成功；再次调用返回 `ErrorCode::kClosedPipe`（照抄 sess.go:470-472）
+2. **`close()` 前 `kcp_->Flush(kFlushFull)`**：持 L2 冲出尾部数据（sess.go:477-479）
+3. **必须 join 两个线程**：读线程与 `PostProcess` 线程。Go 靠 goroutine 自然退出，C++ 不 join 会 `std::terminate()`（#20）。join 前置条件：`die_` 置位 + 队列关闭 + socket shutdown，保证线程可退出
+4. Listener 侧 session 的 `close()` **不关共享 socket**，只移除自身表项（sess.go:481-484）
+5. `close()` 后 `write` 返回 `kClosedPipe`；`read` 返回 `kClosedPipe`；socket 错误返回原始错误
+
+### 3.2 锁层级与并发规则
+
+| 级别 | 锁 | 保护对象 |
+|---|---|---|
+| L0 | 原子 | Snmp 计数、状态位 |
+| L1 | `BlockCrypt` 工作缓冲互斥 `enc_mu_`/`dec_mu_`（**仅 CFB 系；AEAD 无状态无锁**，#44） | 加密工作缓冲 |
+| L2 | `UdpSession::mu_` | KCP 状态、recv_buf_、FEC 编解码器、写队列 |
+| L3 | `Listener::session_lock_` | sessions 映射、accept 队列 |
+
+通道/队列成员（Go channel → C++ 封装）：`chReadEvent`→`read_event_`、`chWriteEvent`→`write_event_`、`chSocketReadError`→`socket_read_error_`、`chSocketWriteError`→`socket_write_error_`、`chPostProcessing`→`post_processing_`（BlockingQueue，满则丢，#38）。
+
+1. 加锁顺序 **L3 → L2 → L1**
+2. **阻塞等待必须释放 L2**：`cv_.wait_until(lk, deadline, pred)`；禁止持 L2 调 sleep/join/sendto
+3. `PostProcess` 调平台层发送前已释放 L2
+4. 回调（TimedSched/accept/OOB handler）**不得持锁调用用户代码**；OOB handler 由 KCP 输入路径同步调用，文档要求"MUST 快速返回、不得阻塞"（照抄 sess.go:845-848）
+5. `PacketInput`（读线程）与 `Update`（调度线程）对 KCP 的访问全在 L2 内
+
+**与 Go 的已知并发差异（#22）**：Go 的 `TimedSched` 是两阶段并行调度器（1 prepend + `max(NumCPU,2)` 个 worker，timedsched.go:34,95），多个 worker 可能**并发**调用同一 session 的 `Update()`，靠 L2 串行化。C++ v1 采用**单线程定时堆**（回调永不并发），语义等价（`Update` 本身是幂等的状态机推进）但少了并行唤醒；差异记录在 README，不影响互通。
+
+### 3.3 API 覆盖清单与命名映射（验收 100%）
+
+**命名规则（Google C++ Style，决策⑦ / v5.4 修正）**：
+
+| 类别 | 规则 | 示例 |
+|---|---|---|
+| 类型 | CamelCase、无下划线、**缩写只大写首字母**、接口**不加 `I` 前缀** | `Kcp`、`UdpSession`、`FecEncoder`、`BlockCrypt`、`AeadCrypt`、`ConstBuffer` |
+| 函数（动作/设置/工厂/包级） | CamelCase | `Send`、`SetNoDelay`、`DialWithOptions`、`NewAesGcmCrypt`、`PeekSize`、`PostProcess` |
+| 函数 · **例外 1**：I/O 语义家族 | snake_case（Google "Exceptions to Naming Rules"：模仿既有 C++/POSIX 实体时沿用原命名） | `read`、`write`、`write_buffers`、`close` |
+| 函数 · **例外 2**：廉价取值存取器 | snake_case（Google "Accessors may be named like variables"） | `conv()`、`rto()`、`srtt()`、`srtt_var()`、`local_addr()`、`remote_addr()`、`addr()`、`oob_max_size()`、`is_aead()`、`wait_snd()`、`mtu()` |
+| 成员 / 参数 / 局部 | snake_case；**类成员加尾下划线** | `snd_wnd_`、`mu_`、`recv_buf_`、`buf_ptr_` |
+| wire 结构体字段 | snake_case，**无尾下划线** | `cmd`、`frg`、`sn`、`len` |
+| 常量 / 枚举值 | `k` + CamelCase；**不加 `kIcp` 前缀**（`namespace kcp` 已限定作用域） | `kMtuDef`、`kOverhead`、`kRtoDef`、`kClosedPipe`、`kTypeData` |
+| 命名空间 | 全小写、顶层用项目名；内部实现用 `internal`（Google 惯例，**不用 `detail`**） | `kcp`、`kcp::internal` |
+| 宏（仅 guard 与平台宏） | `KCP_` + 全大写 | `KCP_UDP_SESSION_H_` |
+
+**"包"的命名（用户提问 #84：C++ 无包概念，对应四层，逐层定死）**：
+
+| 层 | 规则 | 落地 |
+|---|---|---|
+| 命名空间 | 顶层 = 项目名、全小写；内部实现置于 `internal` 子命名空间 | `namespace kcp {}` / `namespace kcp::internal {}`；关闭时写 `}  // namespace kcp` |
+| 目录 | 全小写，公开头与内部头物理分离 | `include/kcp/`（公开）、`include/kcp/internal/`（内部）、`include/kcp/platform/`（平台抽象） |
+| 文件名 / 扩展名 | 全小写 + 下划线，**须具体**；头 `.h`、源 `.cc` | `udp_session.h`、`blocking_queue.cc`（不写 `session.h`、`queue.cc`） |
+| include 写法 | 从项目根起算，不写相对路径 | `#include "kcp/udp_session.h"` |
+
+**Go → C++ 映射总表**（实现时对照源码用，验收逐条核对）：
+
+| Go（kcp-go） | C++（kcp-cpp） | | Go | C++ |
+|---|---|---|---|---|
+| `UDPSession.Read` | `UdpSession::read` | | `SetReadBuffer` | `SetReadBuffer` |
+| `UDPSession.Write` | `write` | | `SetWriteBuffer` | `SetWriteBuffer` |
+| `WriteBuffers` | `write_buffers` | | `SetRateLimit` | `SetRateLimit` |
+| `Close` | `close` | | `SetLogger` | `SetLogger` |
+| `LocalAddr` | `local_addr()` | | `Control` | `Control` |
+| `RemoteAddr` | `remote_addr()` | | `GetConv` | `conv()` |
+| `SetDeadline` | `SetDeadline` | | `GetRTO` | `rto()` |
+| `SetReadDeadline` | `SetReadDeadline` | | `GetSRTT` | `srtt()` |
+| `SetWriteDeadline` | `SetWriteDeadline` | | `GetSRTTVar` | `srtt_var()` |
+| `SetWriteDelay` | `SetWriteDelay` | | `SetOOBHandler` | `SetOobHandler` |
+| `SetWindowSize` | `SetWindowSize` | | `GetOOBMaxSize` | `oob_max_size()` |
+| `SetMtu` | `SetMtu` | | `SendOOB` | `SendOob` |
+| `SetStreamMode` | `SetStreamMode` | | `Listener.Accept` | `Listener::Accept` |
+| `SetACKNoDelay` | `SetAckNoDelay` | | `Listener.AcceptKCP` | `AcceptKcp` |
+| `SetDUP` | `SetDup` | | `Listener.Addr` | `addr()` |
+| `SetNoDelay` | `SetNoDelay` | | `Listen` | `Listen` |
+| `SetDSCP` | `SetDscp` | | `ListenWithOptions` | `ListenWithOptions` |
+| `Dial` | `Dial` | | `DialWithOptions` | `DialWithOptions` |
+| `NewConn` | `NewConn` | | `NewConn2` | `NewConn2` |
+| `NewConn3` | `NewConn3` | | `NewConn4` | `NewConn4` |
+| `NewNoneBlockCrypt` | `NewNoneBlockCrypt` | | `NewSimpleXORBlockCrypt` | `NewSimpleXorBlockCrypt` |
+| `NewTEABlockCrypt` | `NewTeaBlockCrypt` | | `NewXTEABlockCrypt` | `NewXteaBlockCrypt` |
+| `NewSalsa20BlockCrypt` | `NewSalsa20BlockCrypt` | | `NewAESBlockCrypt` | `NewAesBlockCrypt` |
+| **`NewAESGCMCrypt`** | `NewAesGcmCrypt` | | **`NewAEADCrypt`** | `NewAeadCrypt` |
+| `KCP.Input` | `Kcp::Input` | | `KCP.Send` | `Send` |
+| `KCP.Recv` | `Recv` | | `KCP.Flush` | `Flush` |
+| `KCP.Update` | `Update` | | `KCP.Check` | `Check` |
+| `KCP.NoDelay` | `NoDelay` | | `KCP.WndSize` | `WndSize` |
+| `KCP.WaitSnd` | `wait_snd()`（存取器） | | `KCP.PeekSize` | `PeekSize` |
+| `IKCP_*` 宏 | `k`+CamelCase，去 `Icp` 前缀（`IKCP_RTO_DEF`→`kRtoDef`） | | `_itimediff` | `itimediff` |
+| `SystemTimedSched` | `TimedSched`（`Shutdown()`） | | `DefaultSnmp.BytesSent` | `snmp::bytes_sent`（原子） |
+| `fecEncoder/fecDecoder/shardHeap` | `FecEncoder/FecDecoder/ShardHeap` | | `UDPSession.recvbuf/bufptr` | `recv_buf_`/`buf_ptr_` |
+| `BlockCrypt.Encrypt/Decrypt` | `Encrypt`/`Decrypt` | | `BlockCrypt.Seal/Open` | `Seal`/`Open` |
+| `fillRand` | `FillRand` | | `postProcess` | `PostProcess` |
+
+**常量命名规则（#78，取代原 #53 的"二分规则"）**：一律 `k` + CamelCase，**不保留 `IKCP_` 的 `Icp` 前缀**——`namespace kcp` 已限定作用域，再加一层库名前缀属匈牙利记法（Google: Constant Names 只要求 `k` + 混合大小写）：
+- kcp.go 的 `IKCP_*` 宏：`IKCP_MTU_DEF`→`kMtuDef`、`IKCP_OVERHEAD`→`kOverhead`、`IKCP_RTO_DEF`→`kRtoDef`
+- sess.go / crypt.go / fec.go 的常量：`mtuLimit`→`kMtuLimit`、`devBacklog`→`kDevBacklog`、`initialVector`→`kInitialVector`
+
+**API 全集核对（#58/#59/#74，源码 grep 实测，防止编造/漏项）**：
+
+| 类别 | 实测数量 | 清单 |
+|---|---|---|
+| `UDPSession` 导出方法 | **29** | Read Write WriteBuffers Close LocalAddr RemoteAddr SetDeadline SetReadDeadline SetWriteDeadline SetWriteDelay SetWindowSize SetMtu SetStreamMode SetACKNoDelay SetDUP SetNoDelay SetDSCP SetReadBuffer SetWriteBuffer SetRateLimit SetLogger Control GetConv GetRTO GetSRTT GetSRTTVar SetOOBHandler GetOOBMaxSize SendOOB |
+| `Listener` 导出方法 | **11** | Accept AcceptKCP Close Addr SetDeadline **SetReadDeadline SetWriteDeadline** SetReadBuffer SetWriteBuffer SetDSCP **Control** |
+| 包级函数 | **8** | Listen ListenWithOptions Dial DialWithOptions **NewConn NewConn2 NewConn3 NewConn4** |
+| Crypt 工厂 | **13** | **NewAEADCrypt NewAESGCMCrypt** NewSalsa20BlockCrypt NewAESBlockCrypt NewTEABlockCrypt NewXTEABlockCrypt NewSimpleXORBlockCrypt NewNoneBlockCrypt + 5 占位（NewTripleDESBlockCrypt NewBlowfishBlockCrypt NewCast5BlockCrypt NewTwofishBlockCrypt NewSM4BlockCrypt） |
+
+**⚠️ 已修正的 v5 错误**：`DialWithOptionsConn` **不存在**（系编造），真实为 `NewConn/NewConn2/NewConn3/NewConn4`（sess.go:1511-1528）；`NewAESGCMBlockCrypt` 实名 `NewAESGCMCrypt`（crypt.go:113）；`NewAEADCrypt`（crypt.go:103，包装外部 `cipher.AEAD`）此前完全遗漏；Listener 少列 3 个方法。**根因：早期凭印象写 API 清单未 grep 核对。此后任何 API 条目必须附源码行号。**
+
+**核心签名（#63，参数/返回类型钉死，避免实现时各写各的）**：
+
+```cpp
+// UdpSession
+int  read(void* buf, size_t len, std::error_code* ec = nullptr);   // 返回消息字节数；可短读（§3.6）；<0 表示错误
+int  write(const void* data, size_t len, std::error_code* ec = nullptr);
+int  write_buffers(const std::vector<ConstBuffer>& bufs, std::error_code* ec = nullptr); // ConstBuffer = 指针+长度视图
+void close();                                                       // 二次调用置 ec = kClosedPipe
+bool SetMtu(int mtu);                                               // true = 成功（Go 是 ret == 0，见下）
+
+// 包级（block 已含 key —— Go 的 DialWithOptions 没有 key 参数）
+std::shared_ptr<UdpSession> DialWithOptions(
+    const std::string& raddr, std::shared_ptr<BlockCrypt> block,
+    int data_shards, int parity_shards, std::error_code* ec = nullptr);
+std::unique_ptr<Listener> ListenWithOptions(
+    const std::string& laddr, std::shared_ptr<BlockCrypt> block,
+    int data_shards, int parity_shards, std::error_code* ec = nullptr);
+// Listener 独占所有权（内含线程+socket，不可值返回）；session 内持 raw Listener*（对应 Go 的 s.l，非拥有，避免循环引用）
+std::shared_ptr<UdpSession> Listener::Accept(std::error_code* ec = nullptr);
+// NewConn/NewConn2/NewConn3/NewConn4 额外接受 conv 与现成 socket 句柄（对应 net.PacketConn）
+```
+
+**`SetMtu` 返回值语义（#54 衍生）**：Go 返回 `bool` 且实现为 `ret == 0`（kcp 的 SetMtu 返回 0 表示成功），**容易翻车**——C++ 保持"true = 成功"的直觉语义，实现写 `return kcp_->SetMtu(mtu) == 0;` 并在注释标注与 Go 的对应关系。
+
+**⚠️ platform 层封装与残留遮蔽（#80，重写 v5.2 的"系统调用遮蔽"规则）**：函数改 CamelCase 后，`Read`/`Write`/`Close` 与 POSIX `read`/`write`/`close` 大小写不同、**不再构成遮蔽**，遮蔽面从 6 个缩到 3 个。但 **`read`/`write`/`close` 三个保留小写的成员仍与 POSIX 同名**，风险未完全消失，故 platform 层规则必须保留：
+1. `platform/socket.h` 内封装统一 `sys_` 前缀并刻意模仿 POSIX 命名（`sys_socket`/`sys_bind`/`sys_sendto`/`sys_recvfrom`/`sys_close`/`sys_shutdown`/`last_error()`），便于一眼识别系统调用；属 Google "Exceptions to Naming Rules" 明示范围
+2. `udp_session.cc`/`listener.cc` **只准调 platform 层**，不准直接调 `::recv`/`::sendto`——从架构上消灭遮蔽（同时完成 Winsock2/POSIX 差异收敛与错误码归一）
+3. 内部类（`Kcp`/FEC）不碰 socket，无此问题
+4. 实现 `read`/`write`/`close` 成员函数体时**禁止出现非限定的 `read(`/`write(`/`close(`**（会命中成员自身）；需要系统调用时一律走 `sys_*`
+
+**行为差异（#47/#48，验收须逐条测）**：
+- `SetReadBuffer` / `SetWriteBuffer`：仅 Dial 创建的 session 生效；Listener 接受的 session 返回 `kInvalidOperation`（sess.go:621-642）
+- `SetDscp`：Windows 仅部分支持（记录支持矩阵到 README）；Linux `IP_TOS`/`IPV6_TCLASS`；入参 `dscp<<2` 后写入 TOS 字节（sess.go:604-611）
+- `SetRateLimit`：自实现令牌桶，burst = `kMaxBatchSize*kMtuLimit`（替代 x/time/rate）
+
+**OOB 前置条件（#26）**：`SetOobHandler` / `SendOob` 在 `fec_encoder_ == nullptr` 时必须返回错误 `kOobRequiresFec`；`oob_max_size()` 返回 0（sess.go:855,873,894）。P6 测试矩阵中 OOB 项只在 FEC(10,3) 配置下执行。
+
+### 3.4 错误码契约（#23）
+
+| 场景 | Go 语义 | C++ `ErrorCode` |
+|---|---|---|
+| deadline 到期 | `errTimeout` | `kTimeout` |
+| session 已关闭 / 二次 Close | `io.ErrClosedPipe` | `kClosedPipe` |
+| socket 收发错误 | 原始 error | `kSocketError`（附 errno/last_error） |
+| KCP conv 不匹配 | `Input` 返回 -1 | `kConvMismatch` |
+| 输入过短 | `Input` 返回 -2 | `kTooShort` |
+| FEC 恢复失败 | 计入 `FECErrs`，丢包 | `kFecRecoverFailed` |
+| AEAD 校验失败 / CRC 不符 | 计入 `InCsumErrors`，丢包 | `kIntegrityFailed` |
+| 密文不支持 | — | `kUnsupportedCipher` |
+| OOB 无 FEC / 超长 / 队列满 | 报错 / 报错 / **静默丢弃返回 nil** | `kOobRequiresFec` / `kOobTooLarge` / `kOk`(静默) |
+| output 队列满（`PostProcess`） | **丢包 + recycle，靠 KCP 重传** | `kOk`(静默丢，#38) |
+| AEAD Seal 容量不足 | panic | `kBufferTooSmall`（crypt.go:83）**[偏离 D1]** |
+
+错误码实现：`enum class ErrorCode { kOk, kTimeout, kClosedPipe, ... }`（Google: Enumerator Names = `k`+CamelCase）+ 自定义 `error_category`，走 `std::error_code`；核心层返回 `ErrorCode`，不抛异常。**全文只用 `ErrorCode` 这一个名字**（v5.2 曾并列出现 `Errc` 与 `ErrorCode`，已统一）。
+
+### 3.4.1 偏离登记表（#54，总原则 #36 的强制配套）
+
+凡不照抄 Go 行为的点，必须登记在此并注明理由。实现时新增偏离必须先加表项。
+
+| # | 偏离点 | Go 行为 | C++ 行为 | 理由 |
+|---|---|---|---|---|
+| D1 | AEAD `Seal` 容量不足 | `panic("please increase MTU size")` | 返回 `kBufferTooSmall` | 库不 panic；调用方可恢复 |
+| D2 | `SetMtu` 返回值语义 | `bool` 实为 `ret == 0`（0=成功，反直觉） | `true` = 成功 | 语义直觉化，实现等价 |
+| D3 | TimedSched 并行度 | 1 prepend + N=max(NumCPU,2) worker 并发 | 单线程定时堆 | 实现复杂度；语义等价（§3.2） |
+| D4 | 批量收发 | Linux `recvmmsg/sendmmsg` | v1 不做，逐包 sendto/recvfrom | 双平台一致性；P8 补（R7） |
+| D5 | 外部错误类型 | `error` 接口 + pkg/errors 堆栈 | `std::error_code` | 语言差异；不保留 Go 式堆栈 |
+| D6 | 字节切片参数 | `[][]byte` / `[]byte` | `std::vector<ConstBuffer>` / `void*+len` | 语言差异 |
+| D7 | session 生命周期 | GC + goroutine 自然退出 | `shared_ptr` + join | 资源管理是总原则的明确例外（§3.1） |
+| D8 | 行宽 | —（Go 用 gofmt，无 80 列硬限） | **100 列**（Google C++ Style 要求 80） | 密码学 T 表、hex 黄金向量、wire 布局注释在 80 列内不可读；`.clang-format: BasedOnStyle Google, ColumnLimit 100` |
+
+### 3.5 全局对象与静态生命周期（#32/#33）
+
+Go 的 `SystemTimedSched`、`DefaultSnmp`、`defaultBufferPool` 是包级变量，进程退出时**不析构**。C++ 照此设计：
+
+1. 三者均为**函数内静态**（Meyers singleton），避免跨 TU 静态初始化顺序问题（C++11 起首次调用构造，线程安全）
+2. `TimedSched` 提供 `Shutdown()`；**程序正常退出不调用它**（进程结束即止），仅在测试中显式调用以验证线程可回收
+3. `Snmp` / `BufferPool` 不提供析构清理，`std::atexit` 不注册任何依赖上述单例的回调
+4. 禁止在静态对象里持有 `std::thread` 且依赖析构顺序；定时器线程**故意 detach 或由 `Shutdown()` join**，二者择一并在 §6 测试中验证
+
+### 3.6 read / write 运行时段语义（#37/#38/#39，P6 行为核心）
+
+**read（消息边界语义，三条路径，照抄 sess.go:296-334）**：
+1. `buf_ptr_` 有残留（上次 read 的 b 装不下一条消息的尾部）→ 直接 copy 返回，**允许短读**（n < len(b)）
+2. `PeekSize() > 0` 且 `len(b) >= size` → `kcp_->Recv(b)` **DMA 直读用户 buffer**，返回 size
+3. 否则 `kcp_->Recv(recv_buf_)` 中转 → copy 进 b，**剩余进 `buf_ptr_`**
+- 即：**read 返回"一条 KCP 消息（或其残留）"的大小，不保证填满 b**。stream 模式下消息边界由 KCP 内部重组消解，但 buf_ptr_ 机制仍生效
+- `recv_buf_` 容量只增不复核（`capacity < size` 才重分配，#49）；初始 1500（kMtuLimit）
+- 文档必须写明：调用方按循环 read 使用；断言测试须覆盖"小 b 读大消息"的 buf_ptr_ 路径
+
+**write_buffers（sess.go:366-425）**：
+1. 每次循环先查 `socket_write_error_` / `die_`
+2. `wait_snd() < snd_wnd_` 才发送；否则阻塞等 `write_event_`（带 deadline）
+3. 逐 slice 按 `mss_` 切段 `kcp_->Send(b)`
+4. 发完后：`wait_snd() >= snd_wnd_ || !write_delay_` → 立即 `Flush(kFlushFull)`；**`write_delay_` 默认 false → 默认立即 flush**（#39）；`SetWriteDelay(true)` 才等 `Update` tick 聚合
+5. 成功后 `snmp::bytes_sent += n`
+
+**KCP output 回调（sess.go:229-245，#38）**：
+- `size >= kOverhead`（=24，见 §4.7）才投递
+- `BufferPool::Get()` 取 `[:size+header_size_]`，数据 copy 到 `[header_size_:]` 预留头空间
+- 投递 `post_processing_` 队列（容量 `kDevBacklog`=2048）**非阻塞**：满则 **drop + recycle**（KCP 重传兜底）；`die_` 已置位则直接退出
+- C++ 的 `BlockingQueue` 必须实现"满则丢"而非阻塞（阻塞会持 L2 死锁）
+
+### 3.7 SetMtu 契约（#40，撤回 v3 误判）
+
+```
+SetMtu(mtu): mtu = min(kMtuLimit, mtu) - header_size_ - (aead ? aead.Overhead() : 0)
+构造路径同样调用 SetMtu(kMtuDef)（sess.go:248）
+```
+- AEAD 的 `header_size_` 只含 `kNonceSize`(12)，但 `SetMtu` 额外减 `Overhead()`(16) → 最终 UDP 包 ≤ 用户 mtu，**不会 IP 分片**。v3 所述 quirk 不成立，已撤回
+- 默认 `kMtuDef=1400`；六种配置的内部 mtu/mss 见 §4.2 表
+
+### 3.8 加密双接口（#44）
+
+```
+BlockCrypt (CFB 系): virtual void Encrypt(dst, src) / Decrypt(dst, src)   // 支持 in-place
+AeadCrypt  (GCM)   : virtual void Seal(dst, nonce, plaintext) / Open(...)
+                     // Go 的 Encrypt/Decrypt 在 AEAD 上是 panic，C++ 里不提供（编译期隔离）
+```
+- session 持 `std::variant`/抽象基类 + `is_aead()` 分派；写路径按 §4.1 分流
+- `Seal` 前检查 `dst.capacity() - dst.size() >= plaintext.size() + Overhead()`，不足返回 `kBufferTooSmall`（Go panic，crypt.go:83）
+- AAD 恒为空（sess.go:718,726，#46）
+- 每包 nonce：`FillRand` 生成，CFB 16B / GCM 12B（sess.go:717,729）
+
+---
+
+## 4. 线上格式
+
+### 4.1 处理顺序
+
+```
+发送：KCP 输出 → 预留 headerSize → ①FEC 编码 → ②加密 → ③发送
+接收：网络 → 解密 → CRC 校验 → FEC 解码 → KCP
+```
+
+### 4.2 六种配置的 wire 布局
+
+**`S` = KCP 段 = 24B 段头 + payload**。段头 24 字节**已包含 conv**：`conv(4)+cmd(1)+frg(1)+wnd(2)+ts(4)+sn(4)+una(4)+len(4)`（kcp.go:58 注释原文，`IKCP_OVERHEAD = 24`）。**mss = mtu − 24**（kcp.go:198），因此**不得再额外计一次 conv**——早期版本写"conv4 + 24B 段头"是错的，会让段总长算成 28B 头、`len` 字段与 `kcp.json` 全错。
+**`F` = FEC 头 8B**（seqid4 + type2 + size2，即 fecHeaderSizePlus2）。
+
+| 配置 | headerSize | wire |
+|---|---|---|
+| None + 无 FEC | 0 | `S` |
+| None + FEC | 8 | `F ‖ S` |
+| CFB + 无 FEC | 20 | `CFB_enc( nonce16 ‖ crc32_4 ‖ S )`（**整包加密**） |
+| CFB + FEC | 28 | `CFB_enc( nonce16 ‖ crc32_4 ‖ F ‖ S )` |
+| GCM + 无 FEC | 12 | `nonce12 ‖ AES-GCM(S) ‖ tag16` |
+| GCM + FEC | 20 | `nonce12 ‖ AES-GCM(F ‖ S) ‖ tag16` |
+
+- CFB：`nonce` 是 16B 随机填充，**无语义但被加密**；`crc32` 覆盖 `F ‖ S`（不含 nonce/crc 自身）；初始反馈 = `E_K(kInitialVector)`
+- GCM：`headerSize = 12` 不含 16B tag，但 `SetMtu` 减 `Overhead()` 兜底（§3.7）
+
+**六种配置的内部 mtu / mss**（用户 mtu=1400 为例，照 §3.7 公式）：
+
+| 配置 | KCP 内部 mtu | mss |
+|---|---|---|
+| None 无 FEC | 1400 | 1376 |
+| None + FEC | 1392 | 1368 |
+| CFB 无 FEC | 1380 | 1356 |
+| CFB + FEC | 1372 | 1348 |
+| GCM 无 FEC | 1400−12−16 = 1372 | 1348 |
+| GCM + FEC | 1400−20−16 = 1364 | 1340 |
+
+### 4.3 CFB 变体精确语义（#43，crypt.json 向量的依据）
+
+以 `encrypt16` 为例（`encrypt8` 同构，块大小 8）：
+
+```
+tbl = E_K(kInitialVector)                     // 初始反馈，crypt.go:50 常量
+n = len(src) >> 4; repeat = n >> 3; left = n & 7
+for each 128B group:                          // 8x 展开仅性能，无语义
+    for each 16B block:
+        dst[block] = src[block] XOR tbl
+        tbl = E_K(dst[block])                 // 反馈寄存器取密文（标准 CFB）
+for each remaining full 16B block (left 个):  // 同上，逐块
+    ...
+tail = src[base:]                             // 不足一块的残字节
+dst[tail] = src[tail] XOR tbl                 // 纯 XOR：不进 tbl、不再加密
+```
+
+- **残字节规则**：`len(src) % blockSize != 0` 时尾部残字节只 XOR。Go 用宽切片 `dst[base:]` 表达（crypt.go:466-501），**C++ 必须按"块推进 + 尾部 XOR"实现，禁止照抄宽切片字面**
+- `len(src)==0` 直接返回；支持 in-place（`dst==src`，crypt.go:304）
+- decrypt 对称：`dst = src XOR tbl; tbl = E_K(src)`（反馈取**密文**即输入）
+- `crypt.json` 向量**必须含非块对齐长度**（如 8B 块的 13B、16B 块的 33B），否则残字节路径无覆盖
+
+### 4.4 接收侧 FEC 分流（按 `LE16(data[4:6])`）
+
+**⚠️ 该表作用于"解密后的明文"**（§4.1：解密 → CRC → 分流）。CFB 配置下密文里的 `data[4:6]` 是随机字节，对着密文找 `0xf1` 永远找不到——分流必须在解密成功后。
+
+| 值 | 含义 | conv 位置 | payload 位置 | 处理 |
+|---|---|---|---|---|
+| `0x00f1` | FEC data shard | `LE32(data[8:])` | `data[12:]` | FEC 解码 → 去 FEC 头 → `kcp_->input` |
+| `0x00f2` | parity shard | — | — | 仅进解码器，不投上层 |
+| `0x00f3` | OOB | `LE32(data[8:])` | `data[12:]` | 绕过 KCP，投 OOB handler |
+| 其他 | 裸 KCP 段 | `LE32(data[0:])` | — | `kcp_->input` |
+
+不冲突前提：KCP `cmd∈[81,84]` + `frg∈[0,255]` → `LE16` 落在 0x0051..0x0354，与 0x00f1..0x00f3 不重叠。
+
+**OOB 帧完整规格（sess.go:872-935,1094-1101）**：
+- 布局：`FEC头8 ‖ conv4 ‖ payload`，接收端取 `data[kFecHeaderSizePlus2 + 4:]`（sess.go:1100）
+- **复用 FEC 头做解复用，但不进 FEC 编码/解码**（sess.go:889 "Reuse the FEC header layout for demultiplexing, but are NOT protected by FEC"）——无冗余保护、无重传、无 ACK
+- `oob_max_size() = kcp_->mtu() − 4`（sess.go:878，注意是减 `convSize` 而非整个 FEC 头；FEC 头空间已在 `SetMtu` 扣过）
+- 超长判定 `convSize + len(data) > kcp_->mtu` → `kOobTooLarge`（sess.go:904）
+- 队列满 → **静默丢弃返回成功**（sess.go:926-930）；session 关闭 → `kClosedPipe`
+- handler 在**输入路径同步调用**，文档要求 MUST 快速返回
+
+### 4.5 最小长度检查（照抄，注意是 min）
+
+- session 侧：`len < min(24, 8+4)=12` → 丢弃（sess.go:1009）
+- Listener 侧：12B 门槛；FEC data 帧另需 `len ≥ 8+24=32`（sess.go:1213）；裸帧需 `len ≥ 24`（sess.go:1229）
+- output 回调：`size >= IKCP_OVERHEAD` 才投递（#38，值见 §4.7）
+
+### 4.6 KCP 默认参数（#24，kcp.json 逐字节比对的前提）
+
+| 参数 | 默认值 | 出处 |
+|---|---|---|
+| `snd_wnd` / `rcv_wnd` / `rmt_wnd` | 32 / 32 / 32 | kcp.go:49,263-265 |
+| `mtu` / `mss` | 1400 / mtu-24 | kcp.go:50,266-267 |
+| `rx_rto` / `rx_minrto` / `rx_maxrto` | 200 / 100 / 60000 | kcp.go:34-37 |
+| `interval` / `ts_flush` | 100 / 100 | kcp.go:52,271-272 |
+| `ssthresh`（init/min） | 2 / 2 | kcp.go:53,273 |
+| `dead_link` | 20 | kcp.go:54,274 |
+| `fast_ack` | 3 | kcp.go:51 |
+| `probe_init` / `probe_limit` | 500 / 120000 | kcp.go:55-56 |
+| `snd_buf` / `rcv_queue` / `snd_queue` 容量 | wnd×2 | kcp.go:276-278 |
+| 段内 `sn` 偏移 | 12 | kcp.go:64 |
+
+**`rcv_wnd` 会写进段头的 `wnd` 字段** → C++ 默认值必须一致，否则 `kcp.json` 逐字节比对必挂。（表中为协议字段名；对应 C++ 成员为 `snd_wnd_`/`rcv_wnd_`/`rx_rto_` 等，加尾下划线。）
+
+### 4.7 常量与边角（#45/#46/#52）
+
+| Go 名称 | 值 | C++ 常量（`k`+CamelCase） | 用途 |
+|---|---|---|---|
+| `initialVector` | `{167,115,79,156,18,172,27,1,164,21,242,193,252,120,230,107}` | `kInitialVector` | CFB 初始反馈（crypt.go:50） |
+| `saltxor` | `"sH3CIVoF#rWLtJo6"` | `kSaltXor` | simpleXOR 的 PBKDF2 salt（crypt.go:51） |
+| `nonceSize` / `crcSize` / `cryptHeaderSize` | 16 / 4 / 20 | `kNonceSize` / `kCrcSize` / `kCryptHeaderSize` | sess.go:67-74 |
+| `mtuLimit` | 1500 | `kMtuLimit` | sess.go:77；bufferpool 切分粒度、`SetMtu` 上限 |
+| `maxBatchSize` | 64 | `kMaxBatchSize` | 令牌桶 burst 基数（P6 性能基线用） |
+| `devBacklog` | 2048 | `kDevBacklog` | post_processing_ 队列容量（#38 满则丢） |
+| `fecHeaderSize` / `fecHeaderSizePlus2` | 6 / 8 | `kFecHeaderSize` / `kFecHeaderSizePlus2` | FEC 头 6B + 2B 对齐（§4.4 分流靠这 2B） |
+| `maxShardSets` | 3 | `kMaxShardSets` | `DiscardShards` 判据（fec.go:340） |
+| `maxFECEncodeLatency` | 500(ms) | `kMaxFecEncodeLatency` | FEC 连续性常量（§5 fec.json 确定性依据） |
+| `typeData` / `typeParity` / `typeOOB` | 0xf1 / 0xf2 / 0xf3 | `kTypeData` / `kTypeParity` / `kTypeOOB` | FEC 分流 |
+| `IKCP_MTU_DEF` | 1400 | `kMtuDef` | 构造路径 `SetMtu` 入参（kcp.go:53） |
+| `IKCP_OVERHEAD` | **24** | `kOverhead` | 段头字节数（**含 conv**，kcp.go:58）；output 最小段检查；mss = mtu − 24 |
+
+### 4.8 dead_link 判死（#25）
+
+`flush` 中 `segment.xmit >= kcp.dead_link` → `kcp.state = 0xFFFFFFFF`（kcp.go:942-944）。高丢包测试（30%）必须注意：单段重传 20 次即判死，测试时长与丢包率的组合不得触发误判导致的"假失败"。
+
+---
+
+## 5. 黄金向量
+
+生成器 `tools/golden/main.go`（`replace github.com/xtaci/kcp-go/v5 => D:/work/kcp-go`），输出含 `meta{go_version, kcp_go_commit, generated_at, schema}`。
+
+| 向量 | 内容 | 比对方式 |
+|---|---|---|
+| `crypt.json` | 7 算法 × 固定 key/输入缓冲的密文，**含非块对齐长度**（#43） | 逐字节 |
+| `rs.json` | (3,1)(10,3)(20,10)(128,128) 的 parity + 擦除恢复 + 矩阵前 4 行；**每组含一组变长分片**（#41 补齐契约） | 逐字节 |
+| `fec.json` | 编码帧、丢 N 片恢复、OOB 帧 | 逐字节；生成器**断言 parity 帧数 == parityShards**，否则重试（确定性依据是常量 `maxFECEncodeLatency=500`，sess.go:91,698） |
+| `kcp.json` | Send+flush 输出段（消息模式 & 流模式） | **ts 字段（段内偏移 8..11）掩码置零后逐字节**；另断言 ts 与本机时钟差 <5s；params 按 §4.6 固定 |
+| `frame.json` | 给定 KCP 段 → 加密后字节（6 种配置） | 逐字节；CFB/GCM 用**固定 nonce**（session 管线里 nonce 随机，故向量只锁"给定 nonce 下的密文"，组装由 C++ 侧自建 buffer 复算） |
+
+### 5.6 JSON schema（#27，防止实现者猜）
+
+所有文件：`{"meta":{...},"vectors":[...]}`（`kcp.json`/`frame.json` 的元素字段见下）。
+
+```jsonc
+// crypt.json
+{"vectors":[{"algo":"aes128cfb|aes192cfb|aes256cfb|tea|xtea|salsa20|simplexor|none|aesgcm",
+             "block_size":8|16,"key_hex":"..","plain_hex":"..","cipher_hex":"..",
+             // 仅 aesgcm：
+             "nonce_hex":"..","tag_hex":".."}]}
+
+// rs.json
+{"vectors":[{"data_shards":10,"parity_shards":3,"shard_size":1024,
+             "data_hex":[".."],"parity_hex":[".."],"erased":[0,3],
+             "recovered_hex":[".."],"matrix_head":[[..],[..],[..],[..]],
+             // 变长场景（#41）：
+             "var_len":true,"max_len":1024,"shard_lens":[1024,700,...]}]}
+
+// fec.json
+{"vectors":[{"kind":"encode|decode|oob",
+             "data_shards":10,"parity_shards":3,"header_offset":0,"encode_latency_ms":500,
+             "packets_hex":[".."],"parity_hex":[".."],"expect_parity_count":3,
+             "dropped":[0,5],"recovered_hex":[".."],"packet_hex":".."}]}
+
+// kcp.json
+{"vectors":[{"stream":false,
+             "params":{"conv":1,"mtu":1400,"snd_wnd":32,"rcv_wnd":32,
+                       "nodelay":1,"interval":10,"resend":2,"nc":1,"wait_snd":0},
+             "segments":[{"cmd":81,"frg":0,"sn":1,"una":0,"len":1200,
+                          "bytes_hex":"..","ts_masked":true}]}]}
+
+// frame.json
+{"vectors":[{"crypt":"none|cfb|aesgcm","fec":false,
+             "data_shards":0,"parity_shards":0,"header_size":0,
+             "nonce_hex":"..",           // cfb 16B / aesgcm 12B
+             "kcp_seg_hex":"..",
+             "crc32_le":"0x12345678",    // 仅 cfb
+             "encrypted_blob_hex":".."}]}
+```
+
+C++ 侧：`tests/json_reader.{h,cc}`（<120 行扁平解析器，只支持上述结构），schema 变更必须同时更新生成器与解析器。
+
+---
+
+## 6. 阶段与门禁
+
+### P0 脚手架 + 互通工具 + 向量基建（2d）
+`git init`；CMake + Presets（**win/linux 双 preset**，决策⑤）；`build.bat/build.sh`；**`.clang-format`（`BasedOnStyle: Google, ColumnLimit: 100`，D8）**；目录骨架（`.h`/`.cc` + `internal/`）；LICENSE（每个移植文件保留 xtaci MIT 头 + 自实现密码学标注参考规范来源）；`tools/golden` 生成 5 个向量；**`tools/interop/goecho_{server,client}.go` 可编译运行**（#28/#34）；`json_reader` 可解析回写的向量；**核对 §4.7 全部常量（`kOverhead=24` 已填，其余逐条对源码确认）**。
+**门**：
+- [ ] `build.bat` 通过，`ctest` 跑通 ≥1 个真实断言测试
+- [ ] `go run ./tools/golden` 产出 5 个 json（含合法 meta），生成器自检通过
+- [ ] `go run ./tools/interop/goecho_server` 可启动，`goecho_client` 可回环连通
+- [ ] `git log` 有首个提交
+- [ ] §4.7 常量表逐条对源码复核（`kOverhead=24` 已核；其余确认值与行号）
+- [ ] **命名合规**：`clang-format --dry-run --Werror` 全绿；`grep -rn "#pragma once" include src` 为空；每个头文件首个非注释行是 `#define KCP_*_H_`（脚本 `tools/check_guard.py` 校验，5 行）
+- [ ] **双平台**：Linux 侧 `build.sh` + 一个 socket 抽象冒烟测试通过（回环 bind/connect/echo 一句）
+
+### P1 基础原语（1d）
+crc32/sha1/pbkdf2/`FillRand`/snmp/bufferpool（全局单例按 §3.5；pool 按 `kMtuLimit`=1500 定长切分，#49；`FillRand` 双后端 BCryptGenRandom/getrandom）。
+**门**：CRC32("123456789")=0xCBF43926；SHA-1/PBKDF2 标准向量；与 `crypt.json` CRC 字段一致；两平台熵源均产出非全零缓冲。
+
+### P2 加密层（2.5d）
+AES（**AES-NI intrinsics + cpuid 检测 + T 表回退**，决策⑥）→ GCM(GHASH) → Salsa20 → TEA/XTEA → CFB 变体（**§4.3 残字节规则**）→ 双接口工厂（§3.8）。
+**注意**：Salsa20 语义须为 `XORKeyStream(dst+8, src+8, nonce=src[0:8], key)`，即**前 8 字节明文透传**，其余以首 8 字节作 64 位 nonce 做 Salsa20 流加密（crypt.go:175-181）。
+**门**：FIPS-197 / NIST GCM / Salsa20 公开向量；**`crypt.json` 全算法逐字节**（CFB 8B/16B 两路径 × 对齐/非对齐长度；AES 的 AES-NI 与 T 表**两条**路径输出必须一致）；AEAD 容量不足返回错误不 panic；**AES-NI 与 T 表路径交叉互验**（同一 key 分别用两条路径加密，密文相同）。
+
+### P3 Reed-Solomon（2d）
+GF(2⁸) 表 → 系统性 Vandermonde（Vandermonde → 顶部子阵求逆 → 左乘）→ Encode/ReconstructData。
+**接口契约（#41）**：`ReconstructData(shards)` **要求调用方传入等长分片**（缺失分片传空 buffer 占位）；补齐到 maxlen + 尾部清零由 **FEC 层（P4）**负责，不在 RS 内。
+**门**：前 data 行 = 单位阵；**`rs.json` parity 逐字节**（含变长组的补齐结果）；1000 轮随机擦除恢复全对（等长 + 变长各 500 轮）。
+
+### P4 FEC 层（1.5d）
+fecEncoder/fecDecoder/shardHeap；autotune 仅挂点。
+**补齐落地（#41/#42）**：decode 中把已收 shard `[:maxlen]` + 尾部清零；仅 `k < dataShards` 的缺失位分配空 buffer；恢复成功 → recovered 缓冲所有权移交调用者，失败 → 自回收（§3.4 计 FECErrs）。
+**约束**：`shouldTune` 缺省恒 false，包正常入 shardHeap，**严禁实现为 return nil 丢包**（Go 那个分支是真丢包）。
+**门**：`fec.json` 全项逐字节；移植 fec_test（丢 1..N 片、OOB）；断言 FEC 关闭时解码器为 nullptr 且裸 KCP 路径不受影响；**snmp 断言**：`fec_full_shard_set`/`fec_recovered`/`fec_errs` 计数与场景期望一致（#51）。
+
+### P5 KCP 核心（3.5d）
+kcp.go 逐函数移植（含 §4.6 全部默认值、§4.8 dead_link）。
+**门**：`kcp.json`（ts 掩码）逐字节；移植 kcp_test；**§6.2 丢包中继** 0%/10%/30% 下 1MB 完整（注意 #25 判死阈值）；**MTU 边界**（payload = mtu-1/mtu/mtu+1 验证 frg 分段重组）。
+**时限（#69）**：30% 丢包场景单次传输**上限 120s**（RTO 指数退避 + 1MB/1348B ≈ 780 段，理论重传量约 1.4×/段）；超时即判失败并记录 `xmit` 最大值，**不得无限等待**。若 `dead_link` 被触发（state=0xFFFFFFFF），属测试参数不当而非实现缺陷——先降丢包率到 20% 复测。
+
+### P6 会话层（5d）
+socket RAII（**platform/socket 双实现**，决策⑤）→ ringbuffer/`BlockingQueue`(**满则丢**，#38)/`TimedSched`（单线程 + §3.5 生命周期）→ `UdpSession` 管线（**§3.6 read/write 语义、§3.7 SetMtu、§3.8 双接口**）→ `Listener` → OOB/keepalive/deadline/限速/DSCP。
+**门**：
+- [ ] **`frame.json` 6 种配置逐字节**（组装层唯一硬证据）
+- [ ] 回环：10 并发 × 1MB，**FEC(0,0)**、FEC(10,3)+GCM、FEC(10,3)+Salsa20 三组（#70：裸路径并发行为同样要验）
+- [ ] **生命周期（#20/#21）**：阻塞 read 中 close 能返回；二次 close 返回 `kClosedPipe`；close 前 flush 生效（尾部包不丢）；进程退出不 terminate；线程/句柄数回落
+- [ ] **read 语义（#37）**：小 b 读大消息触发 buf_ptr_ 路径；DMA 路径；短读语义；消息边界不跨 read 合并（消息模式）
+- [ ] **FEC 分流四路**：裸段/data/parity/OOB 正确路由；OOB 仅在 FEC 开启下测试（#26）
+- [ ] **错误码行为**：超时/关闭/socket 错误/CRC 失败/output 队列满（静默丢 + KCP 重传兜底）五类与 Go 一致
+- [ ] **行为差异（#47/#48）**：`SetReadBuffer` 对 listener session 报 invalid；`SetDscp` 支持矩阵记录（Windows 部分 / Linux 全）
+- [ ] **性能基线（§6.3）**：与 `goecho` 的 Go↔Go 基线对比，差距写入 README（R7）；AES-NI 路径与 T 表路径的吞吐差也记录
+- [ ] **双平台**：上述回环与生命周期测试在 Windows + Linux 各跑一遍全绿
+
+### P7 验收（1.5~2d）
+`run_matrix.py` 跑 2 方向 × {None, AES-CFB, AES-GCM, Salsa20} × {FEC(0,0), FEC(10,3)} = 16 格，逐格记录握手/1MB 双向校验和/关闭干净度。
+
+**矩阵覆盖度说明（#67）**：这 4 种加密覆盖了三条实现分支——`None`（无加密）、`AES-CFB`（**16B 块** CFB）、`AES-GCM`（AEAD）、`Salsa20`（流密码）；**但 8B 块 CFB 分支（TEA/XTEA）不在矩阵内**，其组装级字节正确性仅由 `crypt.json`（组件级）+ `frame.json`（组装级、C++ 自算）保证，无跨语言端到端验证。这是**已知且接受的覆盖缺口**（理由：8B 块与 16B 块共用同一 CFB 实现，差异仅在块长参数；且 TEA/XTEA 非主流选型）。若后续要补，加 2 格变 20 格。
+
+**止损线**：单格定位 >2d 则降级为"FEC 关闭先互通"，FEC 互通转 P8 并记录未决原因。
+
+### 6.1 互通失败定位流程（#29）
+
+1. 两端各自 dump 首包十六进制（`--dump-packet <file>` 参数，C++/Go 同格式）
+2. `dump_packet.py` 做逐字节 diff，首个差异偏移 + 上下文 ±32B
+3. 按偏移查 §4 布局表定位字段 → 对应源码行号 → 检查该字段的实现
+4. 若 diff 落在密文区 → 优先查 CFB 残字节规则（§4.3）/ GCM nonce 与 tag；若落在 FEC 头 → 查 seqid/type/size 与 RS 补齐；若落在 KCP 段 → 查 §4.6 默认值
+
+### 6.2 丢包中继规格（#49，P5 门禁的可判定前提）
+
+- **形态**：测试内独立线程（不占外部进程），`tests/lossy_relay.{h,cc}`；UDP socket 一对（client_relay / relay_server），双线程转发
+- **丢包模型**：默认均匀随机 `p ∈ {0, 0.1, 0.3}`；额外提供 **Gilbert-Elliott 突发模型**（good/bad 两态，p_g=0.01/p_b=0.5，平均突发长 10）测 KCP 抗突发——两模型结果分别记录
+- **延迟注入**：可选固定延迟 ±10ms 抖动（模拟 RTT）；中继**不得重排、不得损坏字节**（只整包丢弃）
+- **判定**：1MB 载荷 SHA-256 比对 + **snmp 重传计数合理性**（丢包率↑ → `retrans_segs` ↑，30% 下不得触发 dead_link 假失败，§4.8）
+- **对照**：同一中继参数跑 Go↔Go 基线（P6 复用），C++↔C++ 与其对比
+
+### 6.3 性能基线测量方法（#50/#68，P6 门禁的可判定前提）
+
+- **指标**：吞吐（MB/s，1MB×N 累计）、平均 RTT（KCP `srtt()`）、CPU（进程 user+sys 时间 / 墙钟）、常驻内存
+- **场景**：单流 1MB×100（主指标）；10 并发流 × 1MB（次要）；**FEC(0,0)**、FEC(10,3)+GCM、FEC(10,3)+Salsa20 三组
+- **参数一致性（#68，否则基线不可比）**：Go 基线必须使用与 C++ **完全相同的参数**——`conv=1, mtu=1400, nodelay=1, interval=10, resend=2, nc=1`，snd/rcv wnd 32/32，加密与 FEC 组合相同。`goecho_server`/`client` 通过命令行参数显式传入，**不得依赖 kcp-go 默认值**（默认值与 §4.6 不同会导致误判）
+- **统计**：每场景跑 5 轮，去首轮预热，报**中位数 + min/max**；写 `bench.md` 落 README
+- **对照与阈值**：同机 Go↔Go 为基线；C++↔C++ 与之对比。**判定线：吞吐低于基线 30% 或 CPU 高于基线 50% 即视为需要解释**——30% 的来源是"无批量收发（R7）在 1MB 顺序流上的典型损失量级"，属经验阈值而非硬标准；超出即必须在 README 归因（先查 syscall 次数、再查内存拷贝次数）
+- **双平台**：Windows 与 Linux 各测一遍（`sendto` 路径与调度器差异会影响结果），分别记录
+
+---
+
+## 7. 工期
+
+**20~22.5 个工作日当量**（P0 2 / P1 1 / P2 2.5 / P3 2 / P4 1.5 / P5 3.5 / P6 5 / P7 1.5~2），C++ 约 7500~8500 行含测试。
+
+较 v5 的增量：双平台 socket/熵源/构建/测试 +1.5d（决策⑤）；AES-NI + 回退 + 交叉互验 +1d（决策⑥）。
+
+---
+
+## 8. 风险
+
+| # | 风险 | 缓解 |
+|---|---|---|
+| R1 | RS 矩阵与 klauspost 不一致 | `rs.json` 在 P3 仲裁 |
+| R2 | CFB 整包加密/CRC 覆盖范围/8x 展开偏差 | `crypt.json`（P2）+ `frame.json`（P6）双仲裁 |
+| R3 | Windows socket 选项不可用（DSCP 等） | 返回明确"不支持" |
+| R4 | 手写 condvar 与 Go 调度不等价 | §3.2 规则 + 生命周期测试 |
+| R5 | AES 安全性与性能 | AES-NI 路径恒定时间（决策⑥）；仅无 AES-NI 的老 CPU 回退 T 表，README 记录该路径 cache-timing 差距；加固走 P8 |
+| R6 | KCP 后续 tick 无脱机向量 | 行为单测 + 丢包中继 + 端到端互通 |
+| R7 | 无批量收发导致吞吐低于 Go 版 | §6.3 基线实测写 README；P8 补齐 |
+| R8 | 互通 16 格调试时间不可控 | P7 止损线 |
+| R9 | 全局单例析构顺序 / 静态初始化顺序（#32/#33） | §3.5 函数内静态 + 不析构；P6 测"进程退出不 terminate" |
+| R10 | JSON schema 漂移（#27） | §5.6 字段级定义 + `schema` 版本号 |
+| R11 | TimedSched 单线程 vs Go 多 worker | §3.2 记录；不影响协议正确性 |
+| R12 | **CFB 残字节语义误译**（宽切片字面直译，#43） | §4.3 规则 + 非对齐长度向量双保险 |
+| R13 | **Read 消息边界语义误实现**（按"填满 b"写，#37） | §3.6 + P6 bufptr 专项测试 |
+| R14 | **output 队列"满则丢"被实现成阻塞**（持锁死锁，#38） | §3.6 + P6 队列满场景测试 |
+| R15 | RS 等长契约被下压到 RS 层（补齐逻辑重复实现，#41） | §3/P3 接口契约：补齐归 P4 |
+| R16 | **平台行为分叉**（双平台下 socket 选项/调度差异，决策⑤） | platform 抽象层收敛差异；P6 门禁双平台全量回归；§6.3 基线双平台各测 |
+
+---
+
+## 9. 验收标准
+
+- [ ] P1~P6 全部门禁通过（含 5 个向量逐字节、生命周期、错误码、MTU 边界）
+- [ ] §3.3 API 覆盖 100%（映射表逐条兑现：CamelCase 签名 + 仅 `read`/`write`/`write_buffers`/`close` 与 11 个取值存取器为 snake_case 例外 + `k`+CamelCase 常量 + 尾下划线成员）
+- [ ] **命名合规（Google C++ Style）**：`clang-format --dry-run --Werror` 全绿；无 `#pragma once`、guard 全为 `KCP_*_H_`；无 `kIcp*`/`I*` 接口前缀/`Errc` 残留
+- [ ] §3.4 错误码行为与 Go 逐条对齐（含 output 队列满静默丢）
+- [ ] **§3.4.1 偏离登记表 D1~D7 逐条可验证**（每个偏离点有对应测试或文档说明）
+- [ ] MSVC `/W4` + GCC/Clang `-Wall -Wextra` 通过（定点 pragma 抑制需注明原因）
+- [ ] 互通矩阵 16 格全绿（或按止损线降级并记录）
+- [ ] 零第三方依赖（Windows: ws2_32；Linux: 仅 glibc/Threads）
+- [ ] §4 全部表格有自动化测试覆盖（含 CFB 非对齐、RS 变长、§4.7 常量表）
+- [ ] 性能基线落 README（§6.3 方法，双平台各测），与 Go 版差距明确
+- [ ] 并发/生命周期测试后线程与句柄无泄漏，进程退出不 terminate
+- [ ] **双平台**：Windows + Linux 构建、测试、互通冒烟全部通过（决策⑤）

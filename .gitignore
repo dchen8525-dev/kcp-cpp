@@ -1,0 +1,35 @@
+# Build output
+/build/
+/out/
+cmake-build-*/
+
+# IDE
+.vs/
+.vscode/
+*.user
+*.suo
+*.VC.db
+
+# Object / binary artifacts
+*.obj
+*.o
+*.lib
+*.a
+*.dll
+*.so
+*.dylib
+*.exe
+*.pdb
+*.ilk
+
+# Go tooling artifacts
+tools/golden/overlay.json
+tools/interop/**/*.exe
+tools/interop/**/*.test
+
+# Test runtime artifacts
+*.log
+Testing/
+
+# Golden vectors are committed on purpose: tools/golden/out/*.json are the byte-level oracle the
+# C++ port is compared against. Regenerate only when the reference implementation changes.
