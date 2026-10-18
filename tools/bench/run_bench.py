@@ -346,6 +346,21 @@ def calibration(which: str) -> dict:
         if match:
             out["udp_rtt_us"] = float(match.group(1))
 
+    # Per-syscall pricing. This is the number the P8 ordering rests on: sendto() costs an order of
+    # magnitude more than WSASendTo() on Windows, and that is not a property of the datagram or of
+    # the address, so it has to be measured rather than assumed.
+    syscall_cost = base / f"syscall_cost{suffix}"
+    if syscall_cost.exists():
+        result = subprocess.run([str(syscall_cost)], capture_output=True, text=True, timeout=300)
+        wanted = {"sendto_us", "sendto_deep_us", "wsa_send_to_null_ov_us", "connected_send_us",
+                  "recv_ok_us", "recv_empty_us", "probe_ready_us", "probe_notready_us"}
+        for line in result.stdout.splitlines():
+            if not line.startswith(("SYSCALL", "SENDPATH")):
+                continue
+            for key, value in KV_RE.findall(line):
+                if key in wanted:
+                    out[key] = float(value)
+
     aes = base / f"aes_bench{suffix}"
     if aes.exists():
         result = subprocess.run(
@@ -418,6 +433,36 @@ def render_markdown(table: dict, calib: dict, rounds: int) -> str:
                 f"{calib['udp_rtt_us']:.1f} us | what one OS wake-up costs "
                 f"({1e6 / calib['udp_rtt_us']:.0f} round trips/s unbatched); the session layer beats "
                 f"this by draining a burst per wake |"
+            )
+        if "sendto_us" in calib:
+            lines.append(
+                f"| one datagram send, `sendto()` (`bench/syscall_cost`) | "
+                f"{calib['sendto_us']:.1f} us wall | the call this port uses today; "
+                f"`sendto_deep_us` {calib.get('sendto_deep_us', 0):.1f} us keeps a full receive "
+                f"queue, i.e. the cost is not queue-related |"
+            )
+        if "wsa_send_to_null_ov_us" in calib:
+            lines.append(
+                f"| the same datagram via `WSASendTo` | "
+                f"{calib['wsa_send_to_null_ov_us']:.1f} us | "
+                f"{calib['sendto_us'] / calib['wsa_send_to_null_ov_us']:.1f}x cheaper with a null "
+                f"OVERLAPPED (synchronous), so it is neither the async path nor the address "
+                f"argument; `connected_send_us` "
+                f"{calib.get('connected_send_us', 0):.1f} us agrees |"
+            )
+        if "recv_ok_us" in calib:
+            lines.append(
+                f"| one datagram receive, `recvfrom` | {calib['recv_ok_us']:.1f} us | "
+                f"the read path is two orders of magnitude below the send path, which is why the "
+                f"first P8 lever is on the send side |"
+            )
+        if "probe_ready_us" in calib:
+            lines.append(
+                f"| readiness probe the drain loop pays per datagram | "
+                f"{calib['probe_ready_us']:.2f} us | `recv_empty_us` "
+                f"{calib.get('recv_empty_us', 0):.2f} us is what a non-blocking recvfrom costs "
+                f"instead, so replacing the probe is worth ~"
+                f"{calib['probe_ready_us'] - calib.get('recv_empty_us', 0):.2f} us per datagram |"
             )
         if "cfb_ni_mbps" in calib:
             lines.append(

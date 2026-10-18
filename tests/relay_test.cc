@@ -80,7 +80,8 @@ void ServeEcho(const std::shared_ptr<UdpSession>& session, std::atomic<bool>* do
 // Sends `payload` through the relay and checks the echo. Returns false on any failure and normally
 // reports the retransmission count through *retrans.
 bool RunLossyCase(double loss, bool gilbert, std::size_t payload_size, int deadline_ms,
-                  const std::string& label, std::uint64_t* retrans_out) {
+                  const std::string& label, std::uint64_t* retrans_out,
+                  std::uint64_t* dropped_out) {
   std::error_code ec;
   kcp::Crypt crypt;  // no encryption: this gate is about loss, not about the cipher
   crypt.block = nullptr;
@@ -190,6 +191,9 @@ bool RunLossyCase(double loss, bool gilbert, std::size_t payload_size, int deadl
               static_cast<unsigned long long>(stats.dropped),
               static_cast<unsigned long long>(retrans));
   *retrans_out = retrans;
+  if (dropped_out != nullptr) {
+    *dropped_out = static_cast<std::uint64_t>(stats.dropped);
+  }
   return true;
 }
 
@@ -198,21 +202,36 @@ bool RunLossyCase(double loss, bool gilbert, std::size_t payload_size, int deadl
 int main() {
   std::uint64_t retrans = 0;
 
-  // 0% is the control: every datagram must arrive, and retransmissions must stay incidental. The
-  // relay queues (one datagram per wake), so KCP can still fire a fast retransmit on an ack burst;
-  // what must not happen is loss (dropped == 0 is asserted inside RunLossyCase through the relay
-  // stats printed above) or a retransmission storm.
-  constexpr std::uint64_t kCleanRetransBudget = 64;  // 5% of the 762 segments in 1 MiB
-  if (!RunLossyCase(0.0, false, 1u << 20, 30000, "clean", &retrans)) {
+  // 0% is the control. Three invariants of very different strength live here:
+  //
+  //   dropped == 0        exact: the relay forwarded everything it received. This is the property
+  //                       that means "transparent", and it is the one that would catch a relay
+  //                       that starts dropping when its own queue fills.
+  //   payload digest      exact: RunLossyCase compares the echoed bytes, so a relay that corrupts
+  //                       or reorders datagrams fails here regardless of counters.
+  //   retrans <= budget   a storm detector, not a precision instrument. On a clean relay a
+  //                       retransmission means a lost RTO, not lost data - the relay queues one
+  //                       datagram per wake, so a host that deschedules that thread past KCP's RTO
+  //                       produces one. Measured: 0-25 idle, up to 111 during a full parallel MSVC
+  //                       build. Calibrated it against that and it stops testing the relay and
+  //                       starts testing the build machine, which is how this assertion failed once
+  //                       in P8 with retrans=111 of 762 and dropped=0. 25% only fires on a real
+  //                       storm; a relay that black-holes everything is caught by the timeout.
+  constexpr std::uint64_t kCleanRetransBudget = 190;  // 25% of the 762 segments in 1 MiB
+  std::uint64_t dropped = 0;
+  if (!RunLossyCase(0.0, false, 1u << 20, 30000, "clean", &retrans, &dropped)) {
     Fail(__FILE__, __LINE__, "clean run failed");
+  } else if (dropped != 0) {
+    Fail(__FILE__, __LINE__,
+         "0% loss: relay dropped " + std::to_string(dropped) + " datagrams of its own accord");
   } else if (retrans > kCleanRetransBudget) {
-    Fail(
-        __FILE__, __LINE__,
-        "0% loss retransmitted " + std::to_string(retrans) + " segments: relay is not transparent");
+    Fail(__FILE__, __LINE__,
+         "0% loss retransmitted " + std::to_string(retrans) +
+             " of 762 segments: the path is losing or reordering datagrams");
   }
 
   // 10% is the "real link" case: recovery has to happen, and the payload still has to match.
-  if (!RunLossyCase(0.10, false, 1u << 20, 60000, "uniform-10", &retrans)) {
+  if (!RunLossyCase(0.10, false, 1u << 20, 60000, "uniform-10", &retrans, nullptr)) {
     Fail(__FILE__, __LINE__, "10% loss run failed");
   } else if (retrans == 0) {
     Fail(__FILE__, __LINE__, "10% loss recovered nothing");
@@ -220,7 +239,7 @@ int main() {
 
   // 30% is the stress case. Kept at 256 KiB because the relay is real time: every dropped datagram
   // costs a retransmission round trip, and the P5 virtual-clock run already covered 1 MiB.
-  if (!RunLossyCase(0.30, false, 256u << 10, 60000, "uniform-30", &retrans)) {
+  if (!RunLossyCase(0.30, false, 256u << 10, 60000, "uniform-30", &retrans, nullptr)) {
     Fail(__FILE__, __LINE__, "30% loss run failed");
   } else if (retrans == 0) {
     Fail(__FILE__, __LINE__, "30% loss recovered nothing");
@@ -228,7 +247,7 @@ int main() {
 
   // A burst model is a different shape of loss: whole runs of datagrams vanish, which is what makes
   // a sliding window stall. The gate only requires that it still completes.
-  if (!RunLossyCase(0.0, true, 256u << 10, 60000, "gilbert", &retrans)) {
+  if (!RunLossyCase(0.0, true, 256u << 10, 60000, "gilbert", &retrans, nullptr)) {
     Fail(__FILE__, __LINE__, "gilbert burst run failed");
   } else if (retrans == 0) {
     Fail(__FILE__, __LINE__, "gilbert burst loss recovered nothing");

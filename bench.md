@@ -39,7 +39,11 @@ CPU is the client side only, as a percentage of one core over the run.
 
 | measurement | value | meaning |
 | --- | --- | --- |
-| KCP state machine, no I/O (`bench/kcp_pump`) | 2204 MB/s | the protocol engine is not the limit (order of magnitude only; it swings with CPU frequency, 0.8-2.2 GB/s observed) |
-| one cross-thread UDP round trip (`bench/udp_pingpong`) | 86.1 us | what one OS wake-up costs (11616 round trips/s unbatched); the session layer beats this by draining a burst per wake |
-| AES-CFB, AES-NI (`bench/aes_bench`) | 1262 MB/s | 3.81x the T-table path (331 MB/s) |
-| AES-GCM, AES-NI (`bench/aes_bench`) | 168 MB/s | 1.37x the T-table path (123 MB/s) |
+| KCP state machine, no I/O (`bench/kcp_pump`) | 1196 MB/s | the protocol engine is not the limit (order of magnitude only: it swings with CPU frequency, 0.8-2.2 GB/s observed) |
+| one cross-thread UDP round trip (`bench/udp_pingpong`) | 100.0 us | what one OS wake-up costs (10001 round trips/s unbatched); the session layer beats this by draining a burst per wake |
+| one datagram send, `sendto()` (`bench/syscall_cost`) | 45.0 us wall | the call this port uses today; `sendto_deep_us` 42.2 us keeps a full receive queue, i.e. the cost is not queue-related |
+| the same datagram via `WSASendTo` | 2.6 us | 17.2x cheaper with a null OVERLAPPED (synchronous), so it is neither the async path nor the address argument; `connected_send_us` 2.5 us agrees |
+| one datagram receive, `recvfrom` | 1.1 us | the read path is two orders of magnitude below the send path, which is why the first P8 lever is on the send side |
+| readiness probe the drain loop pays per datagram | 0.73 us | `recv_empty_us` 0.28 us is what a non-blocking recvfrom costs instead, so replacing the probe is worth ~0.45 us per datagram |
+| AES-CFB, AES-NI (`bench/aes_bench`) | 1247 MB/s | 3.78x the T-table path (330 MB/s) |
+| AES-GCM, AES-NI (`bench/aes_bench`) | 166 MB/s | 1.37x the T-table path (122 MB/s) |

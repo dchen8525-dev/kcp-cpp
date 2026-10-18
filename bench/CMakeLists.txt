@@ -29,3 +29,14 @@ if(MSVC)
 else()
   target_compile_options(udp_pingpong PRIVATE -Wall -Wextra -Wpedantic)
 endif()
+
+# Per-syscall pricing for the same section: probe_ready / recv_ok / recv_empty / sendto measured
+# one at a time. udp_pingpong says what a wake costs in total; this says how much of it is the
+# readiness probe the drain loop pays once per datagram.
+add_executable(syscall_cost syscall_cost.cc)
+target_link_libraries(syscall_cost PRIVATE kcp::kcp)
+if(MSVC)
+  target_compile_options(syscall_cost PRIVATE /W4 /permissive- /utf-8)
+else()
+  target_compile_options(syscall_cost PRIVATE -Wall -Wextra -Wpedantic)
+endif()

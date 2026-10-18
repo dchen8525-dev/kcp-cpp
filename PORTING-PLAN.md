@@ -1,6 +1,6 @@
-# kcp-cpp 移植计划 v5.11（参考 xtaci/kcp-go v5）
+# kcp-cpp 移植计划 v5.12（参考 xtaci/kcp-go v5）
 
-> 状态：**实施中**（v5.11，累计 20 轮对抗分析（75 条）+ 命名合规审计 + 源码逐行核验 + 用户决策；**P0 ~ P7 已完成**，仅剩 Linux 实机回归（E1）与 P8 优化，见 §6）  
+> 状态：**实施中**（v5.12，累计 20 轮对抗分析（75 条）+ 命名合规审计 + 源码逐行核验 + 用户决策；**P0 ~ P7 已完成**，P8 已定义待开工，仅剩 Linux 实机回归（E1），见 §6）  
 > 目标：将 D:\work\kcp-go（Go）完整移植为 C++17 库，输出到 D:\work\kcp-cpp，零第三方依赖。  
 > 已确认决策：① 加密层自包含实现；② Reed-Solomon 自实现；③ 验收含跨语言互通；  
 > ④ **定位 = 全量独立库**（含 session 层，与 kcp-proxy-cpp 解耦，集成另行议）；  
@@ -169,6 +169,16 @@
 | 127     | **新增偏离 D20**：`SetPacketTrace`（session 与 listener 各一个）。Go 侧靠包装 `net.PacketConn` 即可，C++ 侧的 listener 自持 fd、`Dial` 自建 socket，库内不开洞就没法抓包                                                                  | 实施                                     |
 | 128     | **澄清一处易误读**：`crypt=none` 仍是 **20 字节头**（`NoneBlockCrypt` 只是 Encrypt 空转，nonce+CRC32 照写）；真正的 0 字节头只在"不装 crypt 对象"时（`kcp::Listen`/`Dial`），与 Go 的 `Dial` 行为一致。抓包实测确认，写进 `dump_packet.py` 的注释 | 实测（`none` 抓到 20 字节头）                    |
 
+### v5.11 → v5.12 修订摘要（P8 定义，非分析轮次）
+
+| 编号      | 修订                                                                                                                        |
+| ------- | ------------------------------------------------------------------------------------------------------------------------- |
+| **129** | **新增 `bench/syscall_cost`**：逐调用定价，墙钟 + 进程 CPU 双时钟。测得 `sendto` 41~46 µs 而 `WSASendTo`（含 null OVERLAPPED 的同步语义）2.6 µs |
+| **130** | **新增 `tools/interop/syscallprobe`**：Go 侧同构对照（未连接 `WriteTo` 2.9 µs），加上 Python `sendto` 45 µs，三方一致 ⇒ 与语言运行时无关，是 API 行为               |
+| **131** | **勘误**：§6.3.1 旧写的"4.07 万数据报/秒 ≈ 24.6 µs/包"与 12.2 MB/s ÷ 1376 自相矛盾，改为 8.9k 包/秒/方向 ≈ 112 µs/包；Go 侧同步从 5.5 µs 改为 11.5 µs  |
+| **132** | **新增 P8 阶段定义**（P8.0 仪器化 → P8.1 `WSASendTo` → P8.2 读路径 → P8.3 IOCP → P8.4 Linux 批量 → P8.5 GHASH → P8.6 RS），含每项门禁、触发条件、止损与 §6.3.2 台账  |
+| **133** | 风险表补 R23（"per-call 系统调用成本随 API 变化 15 倍"这类平台陷阱）                                                                            |
+
 ---
 
 ## 0.1 术语表（#65，消除"段/帧/包/shard/消息"混用）
@@ -212,6 +222,7 @@
 D:\work\kcp-cpp\
 ├── CMakeLists.txt / CMakePresets.json / .clang-format / build.bat / build.sh
 ├── PORTING-PLAN.md / LICENSE / README.md / .gitignore
+├── bench.md / matrix.md         # 生成物：§6.3 性能基线 / P7 互通矩阵（脚本产出，入库便于对照）
 ├── include/kcp/{kcp,crypt,udp_session,listener,snmp,error}.h
 ├── include/kcp/internal/{primitives,entropy,clock,byteorder,aes,gcm,salsa20,tea,cfb,
 │                        bufferpool,galois,rs,fec,frame,ringbuffer,kcp_segment,
@@ -229,6 +240,8 @@ D:\work\kcp-cpp\
 │   │   ├── go.mod               # replace → D:/work/kcp-go（与 golden 相同）
 │   │   ├── goserver\            # Go echo 服务端（互通 + 性能基线）
 │   │   ├── goclient\            # Go echo 客户端（反向互通 + 基线对拍）
+│   │   ├── kcptap\               # 包装 net.PacketConn 抓首包（不改 kcp-go）
+│   │   ├── syscallprobe\         # Go 侧 sendto/WriteTo 单位成本（§6.3.1 旁证）
 │   │   ├── run_matrix.py        # 16 格编排：2 方向 × 4 加密 × 2 FEC
 │   │   └── dump_packet.py       # 互通失败定位：抓首包 hexdump + 二进制 diff
 │   └── bench\run_bench.py       # §6.3 基线驱动：cpp / go 两侧同参数，5 轮取中位数，产 bench.md
@@ -238,6 +251,7 @@ D:\work\kcp-cpp\
 └── bench\                       # 归因用微基准（§6.3）
     ├── kcp_pump.cc              # 纯 KCP 状态机吞吐（无 I/O、无加密）
     ├── udp_pingpong.cc          # 跨线程 UDP 往返延迟（平台每数据报握手成本）
+    ├── syscall_cost.cc          # 逐调用定价：sendto/WSASendTo/recvfrom/select(0)，墙钟 + CPU 双时钟
     └── aes_bench.cc             # AES-NI vs T 表两条后端
 ```
 
@@ -935,7 +949,7 @@ socket RAII（**platform/socket 双实现**，决策⑤）→ ringbuffer/`Blocki
 - **场景**：单流 1MB×100（主指标）；10 并发流 × 1MB（次要）；**FEC(0,0)**、FEC(10,3)+GCM、FEC(10,3)+Salsa20 三组
 - **参数一致性（#68，否则基线不可比）**：Go 基线必须使用与 C++ **完全相同的参数**——`conv=1, mtu=1400, nodelay=1, interval=10, resend=2, nc=1`，snd/rcv wnd 32/32，加密与 FEC 组合相同。`goecho_server`/`client` 通过命令行参数显式传入，**不得依赖 kcp-go 默认值**（默认值与 §4.6 不同会导致误判）
 - **统计**：每场景跑 5 轮，去首轮预热，报**中位数 + min/max**；写 `bench.md` 落 README
-- **对照与阈值**：同机 Go↔Go 为基线；C++↔C++ 与之对比。**判定线：吞吐低于基线 30% 或 CPU 高于基线 50% 即视为需要解释**——30% 的来源是"无批量收发（R7）在 1MB 顺序流上的典型损失量级"，属经验阈值而非硬标准；超出即必须在 README 归因（先查 syscall 次数、再查内存拷贝次数）
+- **对照与阈值**：同机 Go↔Go 为基线；C++↔C++ 与之对比。**判定线：吞吐低于基线 30% 或 CPU 高于基线 50% 即视为需要解释**——属经验阈值而非硬标准；超出即必须归因，且**顺序固定：先给每个系统调用定价（`bench/syscall_cost`），再查拷贝次数，最后才怀疑协议/加密**。v5.12 实测证明这条顺序的价值：P6 当时把差距归给"无批量收发（R7）"，主因其实是 `sendto` 这个 API 的单位成本（§6.3.1），而"无批量收发"只解释读侧那 1.75 µs/包
 - **双平台**：Windows 与 Linux 各测一遍（`sendto` 路径与调度器差异会影响结果），分别记录
 
 #### 6.3.1 P6 实测结果与归因（Windows x64，本机回环）
@@ -959,19 +973,107 @@ socket RAII（**platform/socket 双实现**，决策⑤）→ ringbuffer/`Blocki
 | AES-CFB 两条后端（`bench/aes_bench`）          | 1262 / 331 MB/s（3.81x） | 加密不是瓶颈                                                                        |
 | 跨线程 UDP 往返（`bench/udp_pingpong`，20k 次）   | **86 µs**              | 一次 OS 唤醒 ≈43 µs；成批排空的意义在这                                                    |
 | 单流吞吐，窗口 32 / 128 / 512                  | **13.1 / 13.5 / 12.2 MB/s** | **不是窗口×RTT**。窗口放大 16 倍吞吐不动 ⇒ 限制在"每数据报成本"，不在在途字节数                                 |
-| 单流吞吐折算（窗口 32）                           | 4.07 万数据报/秒 ≈ **24.6 µs/数据报** | 客户端一进一出两个数据报都要付 `select` + `recvfrom`/`sendto` 与线程唤醒                                     |
-| Go 侧同参数单流                                | 119.5 MB/s ≈ **5.5 µs/数据报** | 差距 4.5 倍完全落在每数据报的 I/O 与调度上（Go 用 IOCP + goroutine 交接 ≈1 µs）                                |
+| 单流吞吐折算（窗口 32）                           | **8.9k 数据报/秒/方向 ≈ 112 µs/包** | 客户端每发一个数据报要付 `sendto` + `recvfrom` + 就绪探测。**v5.12 勘误**：旧写的"4.07 万包/秒 ≈ 24.6 µs"与 12.2 MB/s ÷ 1376 自相矛盾，是算错的 |
+| Go 侧同参数单流                                | 119.5 MB/s ≈ **11.5 µs/包**（同上勘误） | 差 9.7 倍，比旧的 4.5 倍更大                                                                        |
+| 单个数据报的发送（`bench/syscall_cost`）              | `sendto` **41~46 µs**；`WSASendTo`（null OVERLAPPED）**2.6 µs**；已 connect 的 `send()` **2.5 µs** | **这才是真正的瓶颈**。同一台机器、同一个数据报、同一个目标地址，只换 API 就差 **15~17 倍**。三组对照排除了两个现成解释：不是"异步 vs 同步"（null OVERLAPPED 是同步语义，一样 2.6 µs），不是"地址参数查找"（`WSASendTo` 带地址照样 2.6 µs）。CPU 与墙钟分离后可见：`sendto` 的 44 µs 里只有 21 µs 是 CPU，其余是线程未运行 ⇒ 调用内部在等 |
+| 读路径（同一工具）                              | `recvfrom` **1.0 µs**、就绪探测 `select(0)` **0.75 µs**、非阻塞空读 **0.28 µs** | 读路径比发送路径低两个数量级。**P8 的第一个杠杆在发送侧，不在接收侧** |
+| 旁证：同机 Go 的未连接 `WriteTo`（`tools/interop/syscallprobe`） | **2.9 µs** | 同一台机器、同样是未连接 socket、同样带地址 ⇒ 与语言运行时无关，是 `sendto` 这个 API 在 Windows 上的行为。Python 的 `sendto` 同为 45 µs，三方一致 |
 | CPU（客户端，占单核百分比 / 每字节 CPU 时间）           | C++ 79% · Go 270%       | 绝对 CPU 时间 C++ 更多：100 MiB 用 6.5 s 对 Go 2.2 s。同源同因——每数据报两次系统调用加一次调度，Go 的完成端口把这一层摊掉了 |
 | 单向（`-discard`）                           | **2.48 MB/s**          | **不是回归**：接收侧没有数据可捎带 ACK，只能走 `interval`=10 ms 的 flush tick，再被 Windows 定时器粒度放大到 ≈17 ms。KCP 协议本身的性质，Go 侧同样如此（其工具未提供该开关，故未做交叉对照） |
 | AES-GCM 加速（`bench/aes_bench`）              | **168 MB/s**（T 表 123 MB/s） | GHASH 目前是 4-bit 查表（`internal/gcm.cc:81-113`），没有走 PCLMULQDQ，所以 AES-NI 只体现 1.37 倍而非 CFB 的 3.81 倍。**不是 P6 门禁项**（P2 门禁只要求 `crypt.json` 逐字节），已列入 P8：单流 8.4 MB/s 离 168 MB/s 很远，当前不影响，但一旦 D4/IOCP 把每包成本压下去，GCM 会先成为瓶颈 |
 
 > **勘误（v5.10）**：v5.9 及更早的讨论里曾用"会话层 12 MB/s ≈ 8.6k 包/秒 = 平台往返上限的 83%"来归因。**这个算法是错的**：它把成批流水的段按"每段一次往返"折算，而实际是每批 24 段共享一次往返。窗口扫描实验（吞吐随窗口放大不变）直接证伪了"窗口×RTT 受限"，正确的归因是每数据报的固定 I/O 成本。
 
+
+### P8 性能收敛（定义于 v5.12，尚未开工）
+
+**为什么必须独立成阶段**：P6 的门禁只要求"差距写入 README 并归因"，P7 只要求互通全绿。结果是归因做到了"每数据报固定成本"，但**没有分解到可执行项**——而 v5.12 把这句话变成了具体数字：客户端的每一个数据报都要付一次 `sendto`，而 `sendto` 在本机是 **41~46 µs**，占 112 µs/包的近一半，且这个成本**换一个 API 就消失 15~17 倍**（§6.3.1）。P8 的任务就是把剩下的成本逐段压掉，每一步都可判定。
+
+**P8 的目标线（不是"追平 Go"）**：
+
+- 单流 `none fec=0/0` ≥ **25 MB/s**（当前 12.2，即 2 倍），10 并发同比例改善
+- 每数据报 CPU 时间 ≤ 当前的 **60%**
+- 16 格互通矩阵与 `relay_test` 必须逐项保持全绿；任何一项退化即回滚该项
+- **不承诺**追平 Go 的 119 MB/s：那是 IOCP + goroutine 调度 + 无 per-session 线程的形态差异，追平意味着重写 I/O 模型（P8.3 才讨论），不在本阶段承诺范围内
+
+#### P8.0 仪器化：先把 112 µs/包 拆开（唯一的前置项）
+
+没有这一步，后面每一项都只能靠猜，而 P6 已经证明"猜"在这类问题上会错得离谱（R22）。
+
+- **内容**：给 `UdpSession` 加按线程的时间账——`read` 线程、`post` 线程（FEC + 加密 + `Tx`）、调用者线程（`write` → `Kcp::Send`）各自的 CPU 与墙钟；以及 `SysSendTo`/`SysRecvFrom`/`SysWaitReadable` 的**调用次数与累计耗时**。Windows 用 `GetThreadTimes`，POSIX 用 `clock_gettime(CLOCK_THREAD_CPUTIME_ID)`。
+- **输出**：`echo_client -profile` 在 `RESULT` 行后追加一行 `PROFILE read_cpu_us=… post_cpu_us=… caller_cpu_us=… tx_n=… tx_us=… rx_n=… rx_us=… probe_n=… probe_us=…`
+- **门禁（账必须自洽）**：三段 CPU 之和与进程总 CPU 相差 ≤ 10%；`tx_us`/`rx_us` 与各自调用次数相符（±5%，与 `bench/syscall_cost` 的单次价对照）。**账不自洽就先修账，不许往下走。**
+- **产出**：一张"112 µs/包分解表"写进本文档 §6.3.2，作为 P8.1~P8.6 的排序依据。**这张表出来之前，P8.1 之后任何一项都不许动手。**
+
+#### P8.1 发送路径：`sendto` → `WSASendTo`（Windows）
+
+- **依据**：§6.3.1 的四行实测。同一数据报、同一目标地址：`sendto` 41~46 µs，`WSASendTo`（含 null OVERLAPPED 的同步语义）2.6 µs，已 `connect` 的 `send()` 2.5 µs；Go 的未连接 `WriteTo` 2.9 µs，Python 的 `sendto` 45 µs。**API 决定成本，不是语义、不是地址、不是语言。**
+- **内容**：`platform::SysSendTo` 在 Windows 上改走 `WSASendTo`（`lpOverlapped = nullptr`，保持"返回即代表数据报已交给内核"的同步契约，从而**不需要**改动 `Tx` 的缓冲区生命周期）。POSIX 侧不动（那边 `sendmmsg` 是另一个杠杆，见 P8.4）。
+- **门禁**：
+  1. `frame.json` 六种配置逐字节不变（组装层没动，但这是唯一能挡住"顺手改了缓冲区"的检查）
+  2. 16 格互通矩阵 × 3 轮全绿（含每格首包逐字节对拍）
+  3. `relay_test` 四场景全绿（丢包/重传语义不受影响）
+  4. `build.bat Release` + `Debug` 全部 16 项通过
+  5. `bench/syscall_cost` 与 `run_bench.py` 的前后对照：**吞吐与每包 CPU 至少一项显著改善**；若两者都不动，记录"当前不是瓶颈"并保留改动（它是 P8.3 的前置），不许硬凑结论
+- **风险**：低。`WSASendTo` 与 `sendto` 共用同一条 `AsSockAddr` 路径与同样的长度/族校验；POSIX 侧零改动。
+
+#### P8.2 读路径：去掉每包的 `select(0)` 探测
+
+- **依据**：每包付 `probe_ready` 0.75 µs + `recv_ok` 1.0 µs；改成"先非阻塞 `recvfrom`，遇 `EWOULDBLOCK` 再回到阻塞等待"后是 0.28 µs + 1.0 µs。
+- **量级**：只值 ~0.5 µs/包，**比 P8.1 小两个数量级**。写在这里是为了明确"读路径不是瓶颈"，而不是为了现在做。**触发条件**：P8.0 的表显示读路径占比 > 10%，否则不做。
+- **门禁**：同 P8.1 的 1~5。
+
+#### P8.3 IOCP / 事件驱动（仅在 P8.0 的数据支持下启动）
+
+- **前置**：P8.1 落地后，P8.0 的表显示"I/O 等待仍占单包成本 > 30%"。若 `sendto` 换成 `WSASendTo` 之后单包成本已降到 20 µs 以下，IOCP 的收益上限只是"省掉每包一次线程唤醒"，而读侧已经在批量排空（D16）——**这种情形下不做**。
+- **范围**：只替换 socket I/O 的驱动方式（完成端口 + 每会话不再独占 3 个线程），**不改协议、不改线上字节**。
+- **门禁**：P8.1 的 1~5，外加：线程数不增加、`TestListenerCloseClosesSessions` 与 `TestCloseUnblocksRead` 仍绿（关闭路径是 IOCP 最容易回归的地方）。
+- **止损**：2 个工作日内不能把 16 格矩阵跑绿，回滚并记录未决原因。
+
+#### P8.4 Linux 侧批量收发（D4）
+
+- `recvmmsg`/`sendmmsg`：Linux 上一次系统调用可带多个数据报。**这是 Linux 的主要杠杆，Windows 没有等价 API**（`WSASendMsg` 一次仍只有一个数据报）。
+- **前置**：E1（Linux 实机）先跑通。**没有 Linux 环境就不许写**——无法判定的改动一律不做。
+
+#### P8.5 GHASH 走 PCLMULQDQ
+
+- **依据**：`src/internal/gcm.cc` 目前是 4-bit 查表，AES-GCM 168 MB/s 对 AES-CFB 1262 MB/s，AES-NI 只体现 1.38 倍而非 3.8 倍。
+- **时机**：当前不影响（单流 8.4 MB/s 离 168 MB/s 很远），但 P8.1/P8.3 把每包成本压下去之后它会**先**成为瓶颈。**触发条件**：单流 `aes-gcm fec=10/3` 达到 40 MB/s 以上再动。
+- **门禁**：`TestBackendsAgree` 的六种长度逐字节不变 + NIST 向量 + 实测 ≥ 1.5 倍。
+
+#### P8.6 RS 视图化（R20）
+
+- 省掉 FEC 路径上的一次 memcpy（owning 接口 → 视图接口）。**触发条件**：P8.0 的表显示 FEC 段落占单包成本 > 10%。
+
+#### P8 的通用规则（每条都来自已经踩过的坑）
+
+1. **一项一提交**，每项独立可回滚。禁止"顺手一起改"——R22 的教训就是"看起来同源的两个缺陷其实一个是 recv 错误分类、一个是析构顺序"。
+2. **每项前后对照**：同一 `run_bench.py` 参数，5 轮去首轮取中位数，写进 §6.3.2。禁止只报"改后"的数字。
+3. **回归门不可让步**：`build.bat` 全绿（16 项）+ 16 格互通矩阵 + `relay_test`。任何"吞吐上升但正确性证据减弱"的改动一律回滚。
+4. **测了没用也要记**：写清"试了什么、数字多少、为什么没用、已回退"。P6 已经这样处理过三项自旋优化，避免下一轮重复劳动。
+5. **不许用编译期开关**掩盖未胜出的方案；未胜出的直接删掉。
+
+#### §6.3.2 P8 测量台账（结构已定，数据待 P8.0 填）
+
+| 项 | 状态 | 单流 MB/s（前 → 后） | 每包 CPU（前 → 后） | 结论 |
+| --- | --- | --- | --- | --- |
+| 基线（P6，未改动） | 已测 | 12.2 | 待 P8.0 | §6.3.1 |
+| P8.1 `WSASendTo` | 未开工 | — | — | — |
+| P8.2 去 `select(0)` 探测 | 未开工（有触发条件） | — | — | — |
+| P8.3 IOCP | 未开工（有前置） | — | — | — |
+| P8.4 Linux `sendmmsg` | 未开工（依赖 E1） | — | — | — |
+| P8.5 GHASH PCLMULQDQ | 未开工（有触发条件） | — | — | — |
+| P8.6 RS 视图化 | 未开工（有触发条件） | — | — | — |
+
+**新增工具（v5.12）**：`bench/syscall_cost`（C++ 侧逐调用定价，含墙钟与 CPU 两个时钟）、`tools/interop/syscallprobe`（Go 侧同构对照）。这两个工具不是一次性脚本：`run_bench.py` 的 Calibration 段直接调用它们，所以每次基线都会重测，数字不会过期。
+
 ---
 
 ## 7. 工期
 
 **20~22.5 个工作日当量**（P0 2 / P1 1 / P2 2.5 / P3 2 / P4 1.5 / P5 3.5 / P6 5 / P7 1.5~~2），C++ 约 7500~~8500 行含测试。
+
+**P8 未计入上述数字**（v5.12 补）：它不在原计划的交付范围内，按 §P8 的分解，最坏情形是 P8.0 1d + P8.1 0.5d + P8.2 0.5d + P8.3 2d + P8.4 1d + P8.5 1d ≈ **6d 上限**；其中 P8.2/P8.3/P8.5/P8.6 都带触发条件，实际大概率只做 P8.0 + P8.1（1.5d）。
 
 较 v5 的增量：双平台 socket/熵源/构建/测试 +1.5d（决策⑤）；AES-NI + 回退 + 交叉互验 +1d（决策⑥）。
 
@@ -989,7 +1091,7 @@ socket RAII（**platform/socket 双实现**，决策⑤）→ ringbuffer/`Blocki
 | R4  | 手写 condvar 与 Go 调度不等价                                                | §3.2 规则 + 生命周期测试                                                                                        |
 | R5  | AES 安全性与性能                                                           | AES-NI 路径恒定时间（决策⑥）；仅无 AES-NI 的老 CPU 回退 T 表，README 记录该路径 cache-timing 差距；加固走 P8                          |
 | R6  | KCP 后续 tick 无脱机向量                                                    | 行为单测 + 丢包中继 + 端到端互通                                                                                     |
-| R7  | 无批量收发导致吞吐低于 Go 版                                                     | **已实测**（`bench.md`）：单流 12.8 MB/s 对 Go 120 MB/s；并发 10 流 11 MB/s 对 51 MB/s。归因不是协议/加密/RS（`kcp_pump` 纯状态机 788 MB/s），而是**每数据报 I/O 成本**：窗口 32/128/512 吞吐不变 ⇒ 不是窗口×RTT；4.07 万数据报/秒 ≈ 24.6 µs/数据报，Go 约 5.5 µs。P8 杠杆按收益排序：①非阻塞排空（省每包一次 `select(0)`）②Windows IOCP/overlapped 替换 `select` ③Linux `recvmmsg`/`sendmmsg`（D4）④把 FEC/加密/发送线程并回调用者 |
+| R7  | 无批量收发导致吞吐低于 Go 版                                                     | **已实测并定位到具体调用**（`bench.md` / §6.3.1）：单流 12.2 MB/s 对 Go 119.5 MB/s。归因不是协议/加密/RS（`kcp_pump` 0.8~2.2 GB/s），不是窗口×RTT（32/128/512 吞吐不变），**而是 `sendto` 自己：41~46 µs/包，占 112 µs/包的近一半**；同机 `WSASendTo` 2.6 µs，`WSASendTo`+null OVERLAPPED（同步语义）同样 2.6 µs，已 connect 的 `send()` 2.5 µs，Go 的未连接 `WriteTo` 2.9 µs，Python 的 `sendto` 45 µs ⇒ **API 决定成本**。消解入口是 P8.1                                       |
 | R8  | 互通 16 格调试时间不可控                                                       | P7 止损线                                                                                                  |
 | R9  | 全局单例析构顺序 / 静态初始化顺序（#32/#33）                                          | §3.5 函数内静态 + 不析构；P6 测"进程退出不 terminate"                                                                  |
 | R10 | JSON schema 漂移（#27）                                                  | §5.6 字段级定义 + `schema` 版本号                                                                               |
@@ -1005,6 +1107,7 @@ socket RAII（**platform/socket 双实现**，决策⑤）→ ringbuffer/`Blocki
 | R20 | RS 的 owning `ShardSet` 接口让 FEC 每包多一跳 ~1.4KB memcpy（Go 用 alias 免掉这一跳） | 先实测：P6/P7 吞吐若低于 Go 基线 30%，再给 RS 加 `EncodeView` / `ReconstructView`（视图 + 调用方预分配）；现在动手属未测先改               |
 | R21 | **flush 首帧空转被"顺手修好"**（`cwnd` 初值 0 时首帧不发段，看起来像 bug）                   | `TestCwndBootstrap` 钉住；`kcp.json` 首帧向量在 nc=1 下不受 cwnd 影响，两条路径都要保留                                       |
 | R22 | **"永不返回"的循环被加上了 return**（读循环 / `Close` 递归关闭子节点这两类 Go 形态，加了 `return` 就变成整机停摆或堆损坏） | P6 两处实际踩中：`Monitor` 遇 `WSAECONNRESET` 退出 → 同 listener 全部会话饿死；`Listener::close` 不关子会话 → 会话析构回调已释放的 map（`STATUS_HEAP_CORRUPTION`）。缓解：①照抄 Go 的错误策略（recv 错误只计数）②`Listener.Close` 必须先关全部子会话再关 fd ③判定只能用**共享资源并发形态**（1 listener + N 会话）压测，单连形态永远测不出（实测 160 次单连全绿而并发 15/40 失败）④`TestListenerSurvivesPeerDisappearing` + `TestListenerCloseClosesSessions` 钉住，两处均做过变异回退验证 |
+| R23 | **per-call 系统调用成本随 API 变化一个数量级**（`sendto` 44 µs vs `WSASendTo` 2.6 µs，仅 Windows；Linux 上 `sendto` 本就是 1~2 µs 量级） | `bench/syscall_cost` 把每个调用单独定价（墙钟 + CPU 双时钟），`run_bench.py` 每次基线都重跑它，数字不会过期；P8 每一项都以它做前后对照。**教训**：先给每个系统调用定价，再讨论算法/协议/加密，否则会把 I/O 成本误记到协议头上 |
 
 ---
 

@@ -21,6 +21,7 @@ kcp-go source line number; when code and plan disagree, the plan's line referenc
 | P5 | KCP ARQ state machine | **done** |
 | P6 | UDP session + listener | **done** (Linux run pending, see E1) |
 | P7 | cross-language interop verification (Go <-> C++) | **done** (`matrix.md`, 16/16 x 3 rounds) |
+| P8 | performance convergence | **defined, not started** (`PORTING-PLAN.md` §P8; first item is instrumentation) |
 
 ## Build
 
@@ -87,9 +88,27 @@ protocol, the cipher or Reed-Solomon:
   single OS wake-up costs.
 * **The window is not the limit**: 32 / 128 / 512 gives 13.1 / 13.5 / 12.2 MB/s. A 16x wider window
   changes nothing, so the ceiling is per-datagram cost, not bytes in flight.
-* Fold the numbers out: 40.7k datagrams/s is **24.6 µs per datagram** for C++, against **5.5 µs**
-  for Go at the same parameters. Go pays that with an IOCP completion port and a ~1 µs goroutine
-  handoff; this port pays two syscalls (`select` + `recvfrom`) plus a thread wake per datagram.
+* Fold the numbers out: 12.2 MB/s is **8.9k datagrams/s per direction, ~112 µs per datagram**, against
+  **11.5 µs** for Go at the same parameters.
+* **Then price the calls instead of guessing** (`bench/syscall_cost`, wall clock *and* process CPU):
+
+  | call | wall | CPU |
+  |---|---|---|
+  | `sendto()` — what this port uses today | 41–46 µs | 21 µs |
+  | `WSASendTo()`, null `OVERLAPPED` (synchronous) | 2.6 µs | 2.9 µs |
+  | `WSASendTo()`, overlapped, waited | 3.0 µs | 2.9 µs |
+  | `send()` on a connected socket | 2.5 µs | 2.0 µs |
+  | `recvfrom()` | 1.0 µs | — |
+  | readiness probe (`select(0)`) the drain loop pays per datagram | 0.75 µs | — |
+
+  Same datagram, same destination address, same socket flags: **`sendto` costs 15–17x what
+  `WSASendTo` costs.** Three controls rule out the obvious explanations — a null `OVERLAPPED` is
+  synchronous and still 2.6 µs (so it is not the async path), `WSASendTo` takes the same address
+  argument (so it is not the address lookup), and a connected `send()` agrees. The CPU column says
+  where the time goes: only 21 of `sendto`'s 44 µs is CPU, the rest is the thread not running, i.e.
+  a wait inside the call.
+* Corroborated across runtimes (`tools/interop/syscallprobe`): Go's *unconnected* `WriteTo` is
+  2.9 µs, Python's `sendto` is 45 µs. It is the API on this platform, not the language runtime.
 
 Two numbers that look like regressions but are not, both recorded so nobody re-litigates them:
 
@@ -99,9 +118,20 @@ Two numbers that look like regressions but are not, both recorded so nobody re-l
 * **AES-GCM's AES-NI advantage is only 1.37x, not 3.81x.** GHASH is a 4-bit table
   (`src/internal/gcm.cc:81-113`) with no PCLMULQDQ path yet. Irrelevant at 8.4 MB/s, listed for P8.
 
-Levers, in the order they are worth trying (P8): drain the socket without a second syscall per
-datagram; replace `select` with IOCP/overlapped on Windows; `recvmmsg`/`sendmmsg` on Linux (D4);
-fold the FEC/encrypt/send thread back into the caller.
+P8 is now defined in `PORTING-PLAN.md` with gates, trigger conditions and a kill line per item:
+
+1. **P8.0** instrument it first — per-thread CPU and per-call time, and the ledger has to add up
+   (the three thread budgets within 10% of the process total). No item below starts without it.
+2. **P8.1** `sendto` → `WSASendTo` on Windows. ~41 µs → ~2.6 µs per datagram, measured.
+3. **P8.2** drop the per-datagram `select(0)` probe (worth ~0.5 µs — the read path is *not* the
+   bottleneck, which is exactly why this is listed but gated).
+4. **P8.3** IOCP, only if P8.0 still shows I/O waiting above 30% of per-datagram cost.
+5. **P8.4** `recvmmsg`/`sendmmsg` on Linux (D4) — Linux only, and only once E1 can run.
+6. **P8.5** GHASH via PCLMULQDQ (gated on GCM reaching 40 MB/s). **P8.6** RS views (gated on FEC
+   exceeding 10% of per-datagram cost).
+
+The old guess in this section — "this port pays two syscalls per datagram" — was half right. The
+second syscall costs 0.75 µs; the first one costs 41 µs.
 
 ## Tests
 
