@@ -17,17 +17,22 @@ set(KCP_SOURCES
   src/crypt.cc
   src/error.cc
   src/kcp.cc
+  src/listener.cc
+  src/udp_session.cc
   src/internal/aes.cc
   src/internal/bufferpool.cc
   src/internal/cfb.cc
   src/internal/clock.cc
   src/internal/fec.cc
+  src/internal/frame.cc
   src/internal/galois.cc
   src/internal/gcm.cc
   src/internal/primitives.cc
+  src/internal/rate_limiter.cc
   src/internal/rs.cc
   src/internal/salsa20.cc
   src/internal/tea.cc
+  src/internal/timedsched.cc
   src/platform/entropy_backend.cc
   src/platform/socket.cc
   src/snmp.cc
@@ -46,7 +51,7 @@ if(WIN32)
   target_compile_definitions(kcp PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 else()
   find_package(Threads REQUIRED)
-  target_link_libraries(kcp PRIVATE Threads::Threads)
+  target_link_libraries(kcp PUBLIC Threads::Threads)
 endif()
 
 if(MSVC)
@@ -61,4 +66,8 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   if(BUILD_TESTING)
     add_subdirectory(tests)
   endif()
+  # Echo tools (examples/) and the measuring sticks (bench/): the C++ half of the throughput
+  # baseline in PORTING-PLAN.md §6.3 and the C++ side of the P7 cross-language matrix.
+  add_subdirectory(examples)
+  add_subdirectory(bench)
 endif()

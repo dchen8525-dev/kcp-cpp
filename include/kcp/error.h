@@ -41,6 +41,11 @@ const char* ErrorCodeName(ErrorCode code);
 // Adapter to std::error_code so callers can compose with <system_error> machinery.
 std::error_code MakeErrorCode(ErrorCode code);
 
+// Standard customisation point: std::error_code's converting constructor calls make_error_code()
+// through argument-dependent lookup, so this exact spelling (lowercase, mandated by the standard)
+// is what lets callers write `ec == ErrorCode::kTimeout` or `std::error_code ec = kTimeout`.
+inline std::error_code make_error_code(ErrorCode code) { return MakeErrorCode(code); }
+
 // Convenience: the error_category instance backing MakeErrorCode().
 const std::error_category& KcpErrorCategory();
 

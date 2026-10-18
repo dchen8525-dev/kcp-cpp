@@ -180,6 +180,45 @@ void TestKeySizes() {
   }
 }
 
+// Decision 6: the T-table fallback must produce the same ciphertext as AES-NI, otherwise a host
+// without AES-NI would silently emit different packets than the same binary on a host with it.
+void TestBackendsAgree() {
+  const std::uint8_t key[16] = {0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6,
+                                0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c};
+  const std::uint8_t nonce[12] = {0xca, 0xfe, 0xba, 0xbe, 0xfa, 0xce,
+                                  0xdb, 0xad, 0xde, 0xca, 0xf8, 0x88};
+  const kcp::internal::AesGcm ni(key, sizeof(key), kcp::internal::AesBackend::kNin);
+  const kcp::internal::AesGcm table(key, sizeof(key), kcp::internal::AesBackend::kTable);
+  if (!ni.valid() || !table.valid()) {
+    Fail(__FILE__, __LINE__, "gcm init failed");
+    return;
+  }
+
+  for (const std::size_t len : {std::size_t{0}, std::size_t{1}, std::size_t{15}, std::size_t{16},
+                                std::size_t{17}, std::size_t{1376}, std::size_t{1400}}) {
+    std::vector<std::uint8_t> plain(len);
+    for (std::size_t i = 0; i < len; ++i) {
+      plain[i] = static_cast<std::uint8_t>(i * 13 + 5);
+    }
+    std::vector<std::uint8_t> sealed_ni(len + ni.overhead());
+    std::vector<std::uint8_t> sealed_table(len + table.overhead());
+    ni.Seal(sealed_ni.data(), nonce, plain.data(), len);
+    table.Seal(sealed_table.data(), nonce, plain.data(), len);
+    if (sealed_ni != sealed_table) {
+      Fail(__FILE__, __LINE__, "backends disagree at len " + std::to_string(len));
+    }
+    std::vector<std::uint8_t> opened(len);
+    if (!table.Open(opened.data(), nonce, sealed_ni.data(), sealed_ni.size()) || opened != plain) {
+      Fail(__FILE__, __LINE__, "cross-backend open failed at len " + std::to_string(len));
+    }
+  }
+
+  // The host may lack AES-NI; then kNin falls back internally and the loop above proves nothing.
+  if (!ni.using_ni()) {
+    std::printf("gcm_test: AES-NI unavailable, cross-backend check reduced to a self-compare\n");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -187,6 +226,7 @@ int main() {
   TestTamperDetection();
   TestEmptyPlaintext();
   TestKeySizes();
+  TestBackendsAgree();
 
   if (g_failures != 0) {
     std::fprintf(stderr, "gcm_test: %d failure(s)\n", g_failures);

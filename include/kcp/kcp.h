@@ -121,6 +121,11 @@ class Kcp {
 
   std::uint32_t conv() const { return conv_; }
   std::uint32_t mtu() const { return mtu_; }
+  // Largest payload one segment can carry (kcp.go:198, mtu - kOverhead).
+  std::uint32_t mss() const { return mss_; }
+  // Send/remote window bounds, read by the session's write path to decide whether to block.
+  std::uint32_t snd_wnd() const { return snd_wnd_; }
+  std::uint32_t rcv_wnd() const { return rcv_wnd_; }
 
   // Smoothed RTT and its variance in milliseconds, and the current retransmission timeout.
   std::int32_t srtt() const { return rx_srtt_; }

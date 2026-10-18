@@ -28,10 +28,14 @@ class AesGcm {
   static constexpr std::size_t kTagSize = 16;
   static constexpr std::size_t kBlockSize = 16;
 
-  // key_len must be 16, 24 or 32; valid() reports whether construction succeeded.
-  AesGcm(const std::uint8_t* key, std::size_t key_len);
+  // key_len must be 16, 24 or 32; valid() reports whether construction succeeded. `backend` selects
+  // the AES path (decision 6); it mirrors Aes's constructor so the test suite and bench/ can drive
+  // both backends on one machine and prove they agree.
+  explicit AesGcm(const std::uint8_t* key, std::size_t key_len,
+                  AesBackend backend = AesBackend::kAuto);
 
   bool valid() const { return aes_.valid(); }
+  bool using_ni() const { return aes_.using_ni(); }
   std::size_t nonce_size() const { return kNonceSize; }
   std::size_t overhead() const { return kTagSize; }
 

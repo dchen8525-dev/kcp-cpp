@@ -19,7 +19,9 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -81,6 +83,47 @@ bool SocketAddress::Parse(const std::string& ip, std::uint16_t port, SocketAddre
   }
   out->len_ = static_cast<int>(sizeof(sockaddr_in));
   return true;
+}
+
+bool SocketAddress::ParseHostPort(const std::string& host_port, SocketAddress* out) {
+  if (out == nullptr) {
+    return false;
+  }
+  std::string host;
+  std::string port_text;
+  if (!host_port.empty() && host_port.front() == '[') {
+    const std::size_t close = host_port.find(']');
+    if (close == std::string::npos || close + 1 >= host_port.size() ||
+        host_port[close + 1] != ':') {
+      return false;
+    }
+    host = host_port.substr(1, close - 1);
+    port_text = host_port.substr(close + 2);
+  } else {
+    const std::size_t colon = host_port.rfind(':');
+    if (colon == std::string::npos) {
+      return false;
+    }
+    host = host_port.substr(0, colon);
+    port_text = host_port.substr(colon + 1);
+  }
+  if (port_text.empty() || port_text.size() > 5) {
+    return false;
+  }
+  int port = 0;
+  for (const char c : port_text) {
+    if (c < '0' || c > '9') {
+      return false;
+    }
+    port = port * 10 + (c - '0');
+  }
+  if (port > 65535) {
+    return false;
+  }
+  if (host.empty()) {
+    host = "0.0.0.0";
+  }
+  return Parse(host, static_cast<std::uint16_t>(port), out);
 }
 
 std::string SocketAddress::ToString() const {
@@ -191,6 +234,18 @@ std::string ErrorMessage(int err) {
   return message;
 #else
   return std::string(std::strerror(err));
+#endif
+}
+
+bool IsIgnorableRecvError(int err) {
+#if defined(_WIN32)
+  // WSAECONNRESET: ICMP port/host unreachable from an earlier sendto, reported on the next recv.
+  // WSAENETRESET / WSAETIMEDOUT: the stack gave up on the path; the next datagram retries it.
+  // WSAEMSGSIZE: the datagram was larger than the MTU buffer; it is already lost, keep reading.
+  return err == 10054 || err == 10052 || err == 10060 || err == 10040;
+#else
+  return err == ECONNREFUSED || err == ECONNRESET || err == EAGAIN || err == EWOULDBLOCK ||
+         err == EMSGSIZE;
 #endif
 }
 
@@ -330,6 +385,61 @@ int SysSetRecvTimeout(SocketHandle fd, int timeout_ms) {
   tv.tv_sec = timeout_ms / 1000;
   tv.tv_usec = (timeout_ms % 1000) * 1000;
   return ::setsockopt(ToNative(fd), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+}
+
+int SysWaitReadable(SocketHandle fd, int timeout_ms) {
+  NativeSocket sock = ToNative(fd);
+  fd_set read_set;
+  FD_ZERO(&read_set);
+  FD_SET(sock, &read_set);
+  timeval tv;
+  tv.tv_sec = timeout_ms / 1000;
+  tv.tv_usec = static_cast<long>(timeout_ms % 1000) * 1000;
+#if defined(_WIN32)
+  const int rc = ::select(0, &read_set, nullptr, nullptr, &tv);
+#else
+  const int rc = ::select(static_cast<int>(sock) + 1, &read_set, nullptr, nullptr, &tv);
+#endif
+  if (rc < 0) {
+#if !defined(_WIN32)
+    // A signal is not an error: report a timeout so the caller re-checks its closed flag.
+    if (errno == EINTR) {
+      return 0;
+    }
+#endif
+    return -1;
+  }
+  return rc > 0 ? 1 : 0;
+}
+
+int SysSetDscp(SocketHandle fd, int dscp) {
+  NativeSocket sock = ToNative(fd);
+  unsigned char storage[128];
+  std::memset(storage, 0, sizeof(storage));
+#if defined(_WIN32)
+  int len = static_cast<int>(sizeof(storage));
+  if (::getsockname(sock, AsSockAddr(storage), &len) != 0) {
+    return -1;
+  }
+  if (AsSockAddr(storage)->sa_family == AF_INET6) {
+    return ::setsockopt(sock, IPPROTO_IPV6, IPV6_TCLASS, reinterpret_cast<const char*>(&dscp),
+                        sizeof(dscp));
+  }
+  // Winsock accepts IP_TOS but only applies it to connected sockets, so an unconnected sendto
+  // socket silently keeps 0. Callers see 0 here and the README records the gap.
+  const int tos = dscp << 2;
+  return ::setsockopt(sock, IPPROTO_IP, IP_TOS, reinterpret_cast<const char*>(&tos), sizeof(tos));
+#else
+  socklen_t len = sizeof(storage);
+  if (::getsockname(sock, AsSockAddr(storage), &len) != 0) {
+    return -1;
+  }
+  if (AsSockAddr(storage)->sa_family == AF_INET6) {
+    return ::setsockopt(sock, IPPROTO_IPV6, IPV6_TCLASS, &dscp, sizeof(dscp));
+  }
+  const int tos = dscp << 2;
+  return ::setsockopt(sock, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
 #endif
 }
 

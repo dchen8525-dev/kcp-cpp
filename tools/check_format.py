@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """clang-format compliance check for kcp-cpp (Google style + deviation D8: 100 columns).
 
-Fails when any C++ source under include/, src/, tests/ or examples/ is not formatted. The
+Fails when any C++ source under include/, src/, tests/, examples/ or bench/ is not formatted. The
 clang-format binary is taken from the CLANG_FORMAT environment variable, else from PATH.
 
 Exit code 0 when everything is clean, 1 otherwise.
@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE_DIRS = ("include", "src", "tests", "examples")
+SOURCE_DIRS = ("include", "src", "tests", "examples", "bench")
 SUFFIXES = (".h", ".cc")
 
 

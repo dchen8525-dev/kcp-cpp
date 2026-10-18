@@ -47,3 +47,11 @@ kcp_add_test(ringbuffer_test ringbuffer_test.cc)
 kcp_add_test(kcp_test kcp_test.cc json_reader.cc)
 target_compile_definitions(kcp_test PRIVATE
   KCP_VECTOR_DIR="${CMAKE_SOURCE_DIR}/tools/golden/out")
+
+kcp_add_test(frame_test frame_test.cc json_reader.cc)
+target_compile_definitions(frame_test PRIVATE
+  KCP_VECTOR_DIR="${CMAKE_SOURCE_DIR}/tools/golden/out")
+
+kcp_add_test(session_test session_test.cc)
+
+kcp_add_test(relay_test relay_test.cc lossy_relay.cc)

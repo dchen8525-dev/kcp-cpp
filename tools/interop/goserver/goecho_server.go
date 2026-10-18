@@ -28,6 +28,11 @@ func main() {
 	key := flag.String("key", "kcp-cpp-interop-key", "pre-shared key")
 	dataShards := flag.Int("data", 10, "FEC data shards (0 disables FEC)")
 	parityShards := flag.Int("parity", 3, "FEC parity shards (0 disables FEC)")
+	// Explicit knobs, never the library defaults: PORTING-PLAN.md §6.3 (#68) requires the Go
+	// baseline and the C++ run to use the same tuple, and kcp-go's defaults differ from §4.6.
+	sndwnd := flag.Int("sndwnd", 32, "send window (segments)")
+	rcvwnd := flag.Int("rcvwnd", 32, "receive window (segments)")
+	mtu := flag.Int("mtu", 1400, "mtu")
 	flag.Parse()
 
 	block, err := kcpcrypt.Make(*cryptName, []byte(*key))
@@ -46,7 +51,8 @@ func main() {
 	defer listener.Close()
 
 	// READY is the handshake line run_matrix.py waits for before starting the peer.
-	fmt.Printf("READY crypt=%s fec=%d/%d addr=%s\n", *cryptName, *dataShards, *parityShards, *addr)
+	fmt.Printf("READY crypt=%s fec=%d/%d addr=%s sndwnd=%d rcvwnd=%d mtu=%d\n", *cryptName,
+		*dataShards, *parityShards, *addr, *sndwnd, *rcvwnd, *mtu)
 	_ = os.Stdout.Sync()
 
 	for {
@@ -56,8 +62,8 @@ func main() {
 			return
 		}
 		sess.SetNoDelay(1, 10, 2, 1)
-		sess.SetWindowSize(1024, 1024)
-		sess.SetMtu(1400)
+		sess.SetWindowSize(*sndwnd, *rcvwnd)
+		sess.SetMtu(*mtu)
 		log.Printf("session from %s", sess.RemoteAddr())
 		go func(s *kcp.UDPSession) {
 			defer s.Close()

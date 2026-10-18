@@ -66,7 +66,8 @@ bool ConstantTimeEqual(const std::uint8_t* a, const std::uint8_t* b, std::size_t
 
 }  // namespace
 
-AesGcm::AesGcm(const std::uint8_t* key, std::size_t key_len) : aes_(key, key_len) {
+AesGcm::AesGcm(const std::uint8_t* key, std::size_t key_len, AesBackend backend)
+    : aes_(key, key_len, backend) {
   if (!aes_.valid()) {
     return;
   }

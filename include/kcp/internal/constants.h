@@ -27,6 +27,9 @@ constexpr std::size_t kCryptHeaderSize = kNonceSize + kCrcSize;
 // sess.go:80 - conv field width; oob_max_size() = mtu - kConvSize.
 constexpr std::size_t kConvSize = 4;
 
+// sess.go:83 - pending connections a Listener may hold before it stops accepting new peers.
+constexpr std::size_t kAcceptBacklog = 128;
+
 // sess.go:86 - post-processing queue depth. Full means drop, never block (#38).
 constexpr std::size_t kDevBacklog = 2048;
 
