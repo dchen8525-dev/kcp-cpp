@@ -16,10 +16,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 
 	kcp "github.com/xtaci/kcp-go/v5"
 	"kcpcpp/interop/kcpcrypt"
+	"kcpcpp/interop/kcptap"
 )
 
 func main() {
@@ -33,6 +35,9 @@ func main() {
 	sndwnd := flag.Int("sndwnd", 32, "send window (segments)")
 	rcvwnd := flag.Int("rcvwnd", 32, "receive window (segments)")
 	mtu := flag.Int("mtu", 1400, "mtu")
+	// PORTING-PLAN.md §6.1: capture the first datagram the server receives, byte for byte, so a
+	// mismatch against the peer's capture can be located by offset.
+	dumpPacket := flag.String("dump-packet", "", "write the first datagram to this file")
 	flag.Parse()
 
 	block, err := kcpcrypt.Make(*cryptName, []byte(*key))
@@ -44,9 +49,23 @@ func main() {
 		log.Fatalf("data and parity shards must both be zero or both be non-zero")
 	}
 
-	listener, err := kcp.ListenWithOptions(*addr, block, *dataShards, *parityShards)
+	// ListenUDP + ServeConn instead of ListenWithOptions: the kcp-go API takes a net.PacketConn so
+	// the connection can be wrapped for the §6.1 capture without touching the library.
+	udpAddr, err := net.ResolveUDPAddr("udp", *addr)
+	if err != nil {
+		log.Fatalf("resolve %s: %v", *addr, err)
+	}
+	packetConn, err := net.ListenUDP("udp4", udpAddr)
 	if err != nil {
 		log.Fatalf("listen: %v", err)
+	}
+	var conn net.PacketConn = packetConn
+	if *dumpPacket != "" {
+		conn = &kcptap.Conn{PacketConn: packetConn, Dumper: kcptap.New(*dumpPacket)}
+	}
+	listener, err := kcp.ServeConn(block, *dataShards, *parityShards, conn)
+	if err != nil {
+		log.Fatalf("serve: %v", err)
 	}
 	defer listener.Close()
 

@@ -115,6 +115,17 @@ class UdpSession : public std::enable_shared_from_this<UdpSession> {
   void SetRateLimit(std::uint32_t bytes_per_second);
   void SetLogger(std::uint32_t mask, LogCallback logger);
 
+  // Diagnostic tap on the raw datagrams, for PORTING-PLAN.md §6.1 (locating a cross-language
+  // mismatch by dumping the first packet and diffing it field by field). `outgoing` tells the
+  // direction; `data`/`len` are the bytes exactly as they crossed the socket - already sealed when
+  // outgoing, still sealed when incoming. Not part of the kcp-go API.
+  //
+  // The callback runs on the read and transmit threads, so it must be thread-safe. Pass an empty
+  // function to remove it. Held behind atomic_load/atomic_store so setting it after the session
+  // started is well defined, at the cost of one atomic load per datagram when it is set.
+  using PacketTrace = std::function<void(bool outgoing, const std::uint8_t* data, std::size_t len)>;
+  void SetPacketTrace(PacketTrace trace);
+
   // ---- introspection -------------------------------------------------------------------------
 
   std::uint32_t conv() const;
@@ -232,6 +243,9 @@ class UdpSession : public std::enable_shared_from_this<UdpSession> {
 
   std::mutex oob_mutex_;
   OobCallback oob_callback_;
+
+  // Read with atomic_load in the two I/O loops; see SetPacketTrace.
+  std::shared_ptr<const PacketTrace> packet_trace_;
 };
 
 // ---- package-level constructors (sess.go:1430-1528) -------------------------------------------

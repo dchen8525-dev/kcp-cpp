@@ -69,6 +69,13 @@ class Listener {
   // Number of live sessions. Not exported by the reference; used by tests and diagnostics.
   std::size_t session_count() const;
 
+  // Diagnostic tap for the datagrams the monitor pulls off the socket, in the format the session
+  // uses (PORTING-PLAN.md §6.1). Only the incoming direction exists here: a listener never sends.
+  // Fires before decryption, so the bytes are exactly what came off the wire - which is the whole
+  // point, and why it cannot be folded into UdpSession::SetPacketTrace: OpenInPlace decrypts in
+  // place, destroying the original bytes before the session sees them.
+  void SetPacketTrace(UdpSession::PacketTrace trace);
+
  private:
   friend class UdpSession;
   friend std::unique_ptr<Listener> ListenWithOptions(const std::string&, const Crypt&, int, int,
@@ -107,6 +114,8 @@ class Listener {
   std::atomic<int> socket_error_code_{0};
 
   std::thread monitor_thread_;
+
+  std::shared_ptr<const UdpSession::PacketTrace> packet_trace_;
 };
 
 // ---- package-level constructors (sess.go:1430-1478) -------------------------------------------

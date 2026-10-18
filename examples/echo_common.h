@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -75,6 +76,8 @@ struct Options {
   // Server: print a global SNMP line to stderr every N milliseconds (0 = off). Diagnostics only;
   // it has no effect on the packet path.
   int stats_ms = 0;
+  // Both: capture the first datagram that crosses the socket into this file (§6.1). Empty = off.
+  std::string dump_packet;
 };
 
 // Parses -name value / --name value / -name=value. Accepts both single and double dashes so the Go
@@ -89,6 +92,26 @@ bool MakeCrypt(const std::string& name, const std::string& key, kcp::Crypt* out,
 // Applies no-delay / window size / mtu exactly as the Go tools do, in the same order. Returns false
 // when the mtu is outside the range SetMtu accepts (§3.7).
 bool ApplyTuning(const std::shared_ptr<kcp::UdpSession>& session, const Options& options);
+
+// Captures the first datagram that crosses the socket and writes it in the format
+// tools/interop/dump_packet.py reads (PORTING-PLAN.md §6.1). Both implementations emit the same
+// bytes for the same packet, so a C++ capture and a Go capture of the same datagram are identical
+// files apart from the direction tag - which is exactly how the two taps are verified.
+//
+//   KCPDUMP 1 dir=out len=36
+//   00000000 3c000000f1f10000...
+class FirstPacketDump {
+ public:
+  // An empty path disables the dump; Record then does nothing.
+  explicit FirstPacketDump(std::string path);
+
+  void Record(bool outgoing, const std::uint8_t* data, std::size_t len);
+
+ private:
+  std::mutex mu_;
+  std::string path_;
+  bool done_ = false;
+};
 
 }  // namespace echo
 

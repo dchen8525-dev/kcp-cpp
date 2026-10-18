@@ -16,11 +16,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"time"
 
 	kcp "github.com/xtaci/kcp-go/v5"
 	"kcpcpp/interop/kcpcrypt"
+	"kcpcpp/interop/kcptap"
 )
 
 func main() {
@@ -37,6 +39,8 @@ func main() {
 	sndwnd := flag.Int("sndwnd", 32, "send window (segments)")
 	rcvwnd := flag.Int("rcvwnd", 32, "receive window (segments)")
 	mtu := flag.Int("mtu", 1400, "mtu")
+	// PORTING-PLAN.md §6.1: capture the first datagram this client sends.
+	dumpPacket := flag.String("dump-packet", "", "write the first datagram to this file")
 	flag.Parse()
 
 	cfg := config{
@@ -52,6 +56,7 @@ func main() {
 		sndwnd:       *sndwnd,
 		rcvwnd:       *rcvwnd,
 		mtu:          *mtu,
+		dumpPacket:   *dumpPacket,
 	}
 	if err := execute(cfg); err != nil {
 		fmt.Printf("RESULT ok=0 error=%q iters=%d\n", err.Error(), cfg.iters)
@@ -72,6 +77,7 @@ type config struct {
 	sndwnd       int
 	rcvwnd       int
 	mtu          int
+	dumpPacket   string
 }
 
 func execute(cfg config) error {
@@ -83,7 +89,25 @@ func execute(cfg config) error {
 		return errors.New("data and parity shards must both be zero or both be non-zero")
 	}
 
-	sess, err := kcp.DialWithOptions(cfg.addr, block, cfg.dataShards, cfg.parityShards)
+	// DialWithOptions builds its own connection; NewConn takes a net.PacketConn so it can be
+	// wrapped for the §6.1 capture. The socket stays unconnected, exactly like DialWithOptions.
+	udpAddr, err := net.ResolveUDPAddr("udp", cfg.addr)
+	if err != nil {
+		return fmt.Errorf("resolve %s: %w", cfg.addr, err)
+	}
+	network := "udp4"
+	if udpAddr.IP.To4() == nil {
+		network = "udp"
+	}
+	packetConn, err := net.ListenUDP(network, nil)
+	if err != nil {
+		return fmt.Errorf("socket: %w", err)
+	}
+	var conn net.PacketConn = packetConn
+	if cfg.dumpPacket != "" {
+		conn = &kcptap.Conn{PacketConn: packetConn, Dumper: kcptap.New(cfg.dumpPacket)}
+	}
+	sess, err := kcp.NewConn(cfg.addr, block, cfg.dataShards, cfg.parityShards, conn)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}

@@ -88,6 +88,14 @@ int main(int argc, char** argv) {
   static_cast<void>(listener->SetReadBuffer(options.sockbuf));
   static_cast<void>(listener->SetWriteBuffer(options.sockbuf));
 
+  // §6.1: the listener taps the datagram before decryption, so the capture is the wire bytes.
+  echo::FirstPacketDump dump(options.dump_packet);
+  if (!options.dump_packet.empty()) {
+    listener->SetPacketTrace([&dump](bool outgoing, const std::uint8_t* data, std::size_t len) {
+      dump.Record(outgoing, data, len);
+    });
+  }
+
   // READY is the handshake line the benchmark / matrix scripts wait for before starting a peer.
   std::printf("READY crypt=%s fec=%d/%d addr=%s sndwnd=%d rcvwnd=%d mtu=%d\n",
               options.crypt.c_str(), options.data_shards, options.parity_shards,

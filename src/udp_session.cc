@@ -272,9 +272,13 @@ void UdpSession::PostProcess() {
 }
 
 void UdpSession::Tx(const std::vector<std::vector<std::uint8_t>>& packets) {
+  const std::shared_ptr<const PacketTrace> trace = std::atomic_load(&packet_trace_);
   std::uint64_t bytes = 0;
   std::uint64_t count = 0;
   for (const auto& packet : packets) {
+    if (trace != nullptr) {
+      (*trace)(true, packet.data(), packet.size());
+    }
     const int sent = platform::SysSendTo(fd_, packet.data(), packet.size(), remote_);
     if (sent < 0) {
       NotifyWriteError(platform::LastError());
@@ -333,6 +337,9 @@ void UdpSession::ReadLoop() {
       if (from != remote_) {
         Bump(DefaultSnmp().in_errs, 1);
       } else {
+        if (const auto trace = std::atomic_load(&packet_trace_)) {
+          (*trace)(false, buffer.data(), static_cast<std::size_t>(got));
+        }
         PacketInput(buffer.data(), static_cast<std::size_t>(got));
       }
 
@@ -708,6 +715,16 @@ void UdpSession::SetRateLimit(std::uint32_t bytes_per_second) {
 void UdpSession::SetLogger(std::uint32_t mask, LogCallback logger) {
   std::lock_guard<std::mutex> lock(mu_);
   kcp_->SetLogger(mask, std::move(logger));
+}
+
+void UdpSession::SetPacketTrace(PacketTrace trace) {
+  // atomic_load/atomic_store rather than mu_: the two I/O loops must be able to snapshot the
+  // callback without serialising on a mutex the caller may be holding.
+  if (!trace) {
+    std::atomic_store(&packet_trace_, std::shared_ptr<const PacketTrace>());
+    return;
+  }
+  std::atomic_store(&packet_trace_, std::make_shared<const PacketTrace>(std::move(trace)));
 }
 
 std::uint32_t UdpSession::conv() const {

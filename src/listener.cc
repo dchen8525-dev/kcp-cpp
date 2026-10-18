@@ -139,6 +139,11 @@ void Listener::Monitor() {
       if (closed_.load(std::memory_order_acquire)) {
         return;
       }
+      // Before PacketInput: OpenInPlace decrypts in place, so this is the last point where the
+      // datagram is still byte-identical to what the peer sent.
+      if (const auto trace = std::atomic_load(&packet_trace_)) {
+        (*trace)(false, buffer.data(), static_cast<std::size_t>(got));
+      }
       PacketInput(buffer.data(), static_cast<std::size_t>(got), from);
       if (platform::SysWaitReadable(fd_, 0) != 1) {
         break;
@@ -350,6 +355,15 @@ int Listener::Control(const std::function<int(platform::SocketHandle)>& fn, std:
 std::size_t Listener::session_count() const {
   std::lock_guard<std::mutex> lock(mu_);
   return sessions_.size();
+}
+
+void Listener::SetPacketTrace(UdpSession::PacketTrace trace) {
+  if (!trace) {
+    std::atomic_store(&packet_trace_, std::shared_ptr<const UdpSession::PacketTrace>());
+    return;
+  }
+  std::atomic_store(&packet_trace_,
+                    std::make_shared<const UdpSession::PacketTrace>(std::move(trace)));
 }
 
 void Listener::CloseSession(const platform::SocketAddress& remote) {

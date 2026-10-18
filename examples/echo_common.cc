@@ -231,6 +231,8 @@ bool ParseOptions(int argc, char** argv, Options* out, std::string* error) {
       ok = ParseInt(value, &out->timeout_ms);
     } else if (flag == "discard") {
       out->discard = value.empty() || value == "1" || value == "true";
+    } else if (flag == "dump-packet") {
+      out->dump_packet = value;
     } else {
       *error = "unknown flag -" + flag;
       return false;
@@ -300,6 +302,33 @@ bool ApplyTuning(const std::shared_ptr<kcp::UdpSession>& session, const Options&
   static_cast<void>(session->SetReadBuffer(options.sockbuf));
   static_cast<void>(session->SetWriteBuffer(options.sockbuf));
   return session->SetMtu(options.mtu);
+}
+
+FirstPacketDump::FirstPacketDump(std::string path) : path_(std::move(path)) {}
+
+void FirstPacketDump::Record(bool outgoing, const std::uint8_t* data, std::size_t len) {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (path_.empty() || done_) {
+    return;
+  }
+  done_ = true;
+
+  std::FILE* file = std::fopen(path_.c_str(), "wb");
+  if (file == nullptr) {
+    return;
+  }
+  std::fprintf(file, "KCPDUMP 1 dir=%s len=%zu\n", outgoing ? "out" : "in", len);
+  // 32 bytes per line: "00000000 " then 64 lowercase hex digits.
+  static const char kHex[] = "0123456789abcdef";
+  for (std::size_t offset = 0; offset < len; offset += 32) {
+    std::fprintf(file, "%08zx ", offset);
+    for (std::size_t i = offset; i < offset + 32 && i < len; ++i) {
+      std::fputc(kHex[data[i] >> 4], file);
+      std::fputc(kHex[data[i] & 0x0f], file);
+    }
+    std::fputc('\n', file);
+  }
+  std::fclose(file);
 }
 
 }  // namespace echo

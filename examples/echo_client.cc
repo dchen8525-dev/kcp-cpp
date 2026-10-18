@@ -60,6 +60,12 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "echo_client: mtu %d rejected\n", options.mtu);
     return 2;
   }
+  echo::FirstPacketDump dump(options.dump_packet);
+  if (!options.dump_packet.empty()) {
+    session->SetPacketTrace([&dump](bool outgoing, const std::uint8_t* data, std::size_t len) {
+      dump.Record(outgoing, data, len);
+    });
+  }
   session->SetDeadline(std::chrono::steady_clock::now() +
                        std::chrono::milliseconds(options.timeout_ms));
 
