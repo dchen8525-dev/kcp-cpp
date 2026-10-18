@@ -1,6 +1,6 @@
-# kcp-cpp 移植计划 v5.4（参考 xtaci/kcp-go v5）
+# kcp-cpp 移植计划 v5.5（参考 xtaci/kcp-go v5）
 
-> 状态：待审核（v5.4，累计 20 轮对抗分析（75 条）+ 命名合规审计 + 源码逐行核验 + 用户决策）
+> 状态：**实施中**（v5.5，累计 20 轮对抗分析（75 条）+ 命名合规审计 + 源码逐行核验 + 用户决策；**P0 已完成**，见 §6）
 > 目标：将 D:\work\kcp-go（Go）完整移植为 C++17 库，输出到 D:\work\kcp-cpp，零第三方依赖。
 > 已确认决策：① 加密层自包含实现；② Reed-Solomon 自实现；③ 验收含跨语言互通；
 > ④ **定位 = 全量独立库**（含 session 层，与 kcp-proxy-cpp 解耦，集成另行议）；
@@ -88,6 +88,18 @@
 | 21 | 82 | 新增偏离 **D8：行宽 80 → 100**。Google 硬性要求 80 列，但密码学 T 表、hex 黄金向量、wire 布局注释在 80 列内不可读；`.clang-format` 用 `BasedOnStyle: Google, ColumnLimit: 100` | Google: Line Length |
 | 21 | 83 | P0 增 `.clang-format` + `clang-format --dry-run --Werror` 门禁 + guard 命名检查；`json_reader` / `lossy_relay` 扩展名同步 | — |
 | 21 | 84 | §3.3 增**"包"命名四层说明**（C++ 无包概念）：命名空间 `kcp` / `kcp::internal`、目录 `include/kcp/internal/`、文件名+扩展名、include 写法 `#include "kcp/udp_session.h"` | 用户提问 |
+
+### v5.4 → v5.5 修订摘要（P0 实施，非分析轮次）
+
+| 编号 | 修订 | 依据 |
+|---|---|---|
+| **85** | **P0 完成**：脚手架、CMake 双 preset、platform socket 层、5 个黄金向量、Go 互通工具、两条命名门禁全部落地；门禁勾选见 §6 P0 | 实施 |
+| 86 | **向量生成改用 `go test -overlay` 注入**：`tools/golden/ref/golden_ref.go.txt` 以 `package kcp` 注入参考仓库（不落文件、不改仓库），换取 `fecEncoder`/`fecDecoder`/`initialVector` 的访问权 | 实施发现（原计划 `main.go` 直调不可行，这些符号未导出） |
+| 87 | **`rs.json` 的 `matrix_head` 改为单位向量反解**：对 `e_c` 编码后读 parity 行首字节；由线性性等价于内部矩阵前若干行 | `genMatrix` 未导出 |
+| 88 | **`tools/interop` 目录分离**：`goserver/` + `goclient/` + `kcpcrypt/`；同目录两个 `main` 会让 `go build ./...` 失败 | 实施 |
+| 89 | **`build.bat` 增 Windows SDK 回退**：`vcvars64.bat` 依赖 `reg.exe`，受限 shell 下静默失败，表现为 `LNK1104: kernel32.lib`；回退到标准 SDK 根下最新版本 | 实施发现 |
+| 90 | **新增环境阻塞 E1**：本机 WSL 被禁用且无独立 g++，Linux 侧 `build.sh` 冒烟未执行；Windows 侧 Debug/Release 全绿 | 环境 |
+| 91 | §4.7 常量表补齐 `convSize=4` 并逐条补行号（sess.go/fec.go） | P0 门禁 |
 
 ---
 
@@ -520,14 +532,15 @@ dst[tail] = src[tail] XOR tbl                 // 纯 XOR：不进 tbl、不再�
 |---|---|---|---|
 | `initialVector` | `{167,115,79,156,18,172,27,1,164,21,242,193,252,120,230,107}` | `kInitialVector` | CFB 初始反馈（crypt.go:50） |
 | `saltxor` | `"sH3CIVoF#rWLtJo6"` | `kSaltXor` | simpleXOR 的 PBKDF2 salt（crypt.go:51） |
-| `nonceSize` / `crcSize` / `cryptHeaderSize` | 16 / 4 / 20 | `kNonceSize` / `kCrcSize` / `kCryptHeaderSize` | sess.go:67-74 |
+| `nonceSize` / `crcSize` / `cryptHeaderSize` | 16 / 4 / 20 | `kNonceSize` / `kCrcSize` / `kCryptHeaderSize` | sess.go:68,71,74（`cryptHeaderSize = nonceSize + crcSize`） |
+| `convSize` | 4 | `kConvSize` | sess.go:80；`oob_max_size() = mtu − 4`（§4.4） |
 | `mtuLimit` | 1500 | `kMtuLimit` | sess.go:77；bufferpool 切分粒度、`SetMtu` 上限 |
-| `maxBatchSize` | 64 | `kMaxBatchSize` | 令牌桶 burst 基数（P6 性能基线用） |
-| `devBacklog` | 2048 | `kDevBacklog` | post_processing_ 队列容量（#38 满则丢） |
-| `fecHeaderSize` / `fecHeaderSizePlus2` | 6 / 8 | `kFecHeaderSize` / `kFecHeaderSizePlus2` | FEC 头 6B + 2B 对齐（§4.4 分流靠这 2B） |
-| `maxShardSets` | 3 | `kMaxShardSets` | `DiscardShards` 判据（fec.go:340） |
-| `maxFECEncodeLatency` | 500(ms) | `kMaxFecEncodeLatency` | FEC 连续性常量（§5 fec.json 确定性依据） |
-| `typeData` / `typeParity` / `typeOOB` | 0xf1 / 0xf2 / 0xf3 | `kTypeData` / `kTypeParity` / `kTypeOOB` | FEC 分流 |
+| `devBacklog` | 2048 | `kDevBacklog` | sess.go:86；post_processing_ 队列容量（#38 满则丢） |
+| `maxBatchSize` | 64 | `kMaxBatchSize` | sess.go:94；令牌桶 burst 基数（P6 性能基线用） |
+| `fecHeaderSize` / `fecHeaderSizePlus2` | 6 / 8 | `kFecHeaderSize` / `kFecHeaderSizePlus2` | fec.go:51-52；FEC 头 6B + 2B 对齐（§4.4 分流靠这 2B） |
+| `typeData` / `typeParity` / `typeOOB` | 0xf1 / 0xf2 / 0xf3 | `kTypeData` / `kTypeParity` / `kTypeOob` | fec.go:53-55；FEC 分流 |
+| `maxShardSets` | 3 | `kMaxShardSets` | fec.go:58；`DiscardShards` 判据（fec.go:340） |
+| `maxFECEncodeLatency` | 500(ms) | `kMaxFecEncodeLatency` | sess.go:91；`encode()` 的连续性入参（sess.go:698），§5 fec.json 确定性依据 |
 | `IKCP_MTU_DEF` | 1400 | `kMtuDef` | 构造路径 `SetMtu` 入参（kcp.go:53） |
 | `IKCP_OVERHEAD` | **24** | `kOverhead` | 段头字节数（**含 conv**，kcp.go:58）；output 最小段检查；mss = mtu − 24 |
 
@@ -598,13 +611,24 @@ C++ 侧：`tests/json_reader.{h,cc}`（<120 行扁平解析器，只支持上述
 ### P0 脚手架 + 互通工具 + 向量基建（2d）
 `git init`；CMake + Presets（**win/linux 双 preset**，决策⑤）；`build.bat/build.sh`；**`.clang-format`（`BasedOnStyle: Google, ColumnLimit: 100`，D8）**；目录骨架（`.h`/`.cc` + `internal/`）；LICENSE（每个移植文件保留 xtaci MIT 头 + 自实现密码学标注参考规范来源）；`tools/golden` 生成 5 个向量；**`tools/interop/goecho_{server,client}.go` 可编译运行**（#28/#34）；`json_reader` 可解析回写的向量；**核对 §4.7 全部常量（`kOverhead=24` 已填，其余逐条对源码确认）**。
 **门**：
-- [ ] `build.bat` 通过，`ctest` 跑通 ≥1 个真实断言测试
-- [ ] `go run ./tools/golden` 产出 5 个 json（含合法 meta），生成器自检通过
-- [ ] `go run ./tools/interop/goecho_server` 可启动，`goecho_client` 可回环连通
-- [ ] `git log` 有首个提交
-- [ ] §4.7 常量表逐条对源码复核（`kOverhead=24` 已核；其余确认值与行号）
-- [ ] **命名合规**：`clang-format --dry-run --Werror` 全绿；`grep -rn "#pragma once" include src` 为空；每个头文件首个非注释行是 `#define KCP_*_H_`（脚本 `tools/check_guard.py` 校验，5 行）
-- [ ] **双平台**：Linux 侧 `build.sh` + 一个 socket 抽象冒烟测试通过（回环 bind/connect/echo 一句）
+- [x] `build.bat` 通过，`ctest` 跑通 ≥1 个真实断言测试 → 2 个（`smoke_socket_test`、`vector_meta_test`），Debug + Release 均全绿
+- [x] 生成器产出 5 个 json（含合法 meta），`vector_meta_test` 对 5 个文件的 schema / 长度不变量全部通过
+- [x] Go echo server 可启动、client 可回环连通（802 行内 1 MiB @ aes + FEC 10/3，65 MB/s）
+- [x] `git log` 有首个提交（`1150c03`）
+- [x] §4.7 常量表逐条对源码复核（含 `kOverhead=24` 含 conv、`convSize=4` 补齐、fec 常量行号）
+- [x] **命名合规**：`clang-format --dry-run --Werror` 全绿（6 文件）、`check_guard.py` 通过、无 `#pragma once`
+- [ ] **双平台**：Linux 侧 `build.sh` 冒烟 **未验证**——本机 WSL 被安全策略禁用、无独立 g++；`build.sh` 与 linux preset 已就位，待有 Linux 环境时补跑（记为 E1）
+
+#### P0 实施记录（v5.5，与计划的偏差）
+
+| 项 | 计划 | 实际 | 原因 |
+|---|---|---|---|
+| 向量生成器入口 | `tools/golden/main.go` 直接调用参考实现 | `gen.go`（驱动）+ `ref/golden_ref.go.txt`（`go test -overlay` 注入 kcp-go 包内执行） | `fecEncoder`/`fecDecoder`/`initialVector` 均未导出；overlay 是唯一既访问私有符号又不改动参考仓库的方式 |
+| 向量来源 | §5 表格 | 5 个文件全部由参考实现产出，逐个自检（crypt 往返、RS 擦除恢复、FEC parity 计数与类型、KCP 段长度一致性、frame 六配置） | — |
+| interop 布局 | `tools/interop/goecho_{server,client}.go` 平铺 | `goserver/`、`goclient/`、`kcpcrypt/`（共享工厂） | 同目录两个 `main` 会让 `go build ./...` 失败；目录分离是 Go 惯例 |
+| `matrix_head` | 取 RS 内部矩阵前 4 行 | 通过编码单位向量 `e_c` 反解（公开 API） | `genMatrix` 未导出；由线性性保证与内部矩阵逐位相同 |
+| 构建环境 | — | `build.bat` 增加 Windows SDK 回退（vcvars 依赖 `reg.exe`，受限 shell 下会失败） | 沙箱与部分 CI 环境屏蔽 reg.exe，否则报 `LNK1104: kernel32.lib` |
+| 门禁脚本 | `check_guard.py`（5 行） | `check_guard.py` + `check_format.py` 并入 `build.bat` | 计划要求两条门禁，统一由构建脚本执行 |
 
 ### P1 基础原语（1d）
 crc32/sha1/pbkdf2/`FillRand`/snmp/bufferpool（全局单例按 §3.5；pool 按 `kMtuLimit`=1500 定长切分，#49；`FillRand` 双后端 BCryptGenRandom/getrandom）。
