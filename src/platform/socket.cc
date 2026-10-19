@@ -337,9 +337,11 @@ int SysRecvFrom(SocketHandle fd, void* buf, std::size_t len, SocketAddress* from
     }
   }
   if (got >= 0 && from != nullptr) {
-    if (scratch_len <= from->mutable_size()) {
+    // socklen_t is unsigned on POSIX and int on Windows; compare in one type so the truncating
+    // buffer size check cannot be read as a signed/unsigned mismatch.
+    if (static_cast<std::size_t>(scratch_len) <= static_cast<std::size_t>(from->mutable_size())) {
       std::memcpy(from->mutable_data(), scratch, static_cast<std::size_t>(scratch_len));
-      from->set_size(scratch_len);
+      from->set_size(static_cast<int>(scratch_len));
     }
   }
   return static_cast<int>(got);

@@ -61,9 +61,9 @@ bool ReadSystemRandom(void* buf, std::size_t len) {
                                     BCRYPT_USE_SYSTEM_PREFERRED_RNG);
   return status == 0;
 #else
-#if defined(__linux__)
   auto* out = static_cast<std::uint8_t*>(buf);
   std::size_t offset = 0;
+#if defined(__linux__)
   while (offset < len) {
     const ssize_t got = ::getrandom(out + offset, len - offset, 0);
     if (got < 0) {
@@ -78,13 +78,12 @@ bool ReadSystemRandom(void* buf, std::size_t len) {
     return true;
   }
 #endif
-  // Portable fallback: /dev/urandom (also covers non-Linux POSIX).
+  // Portable fallback: /dev/urandom (also covers non-Linux POSIX). Resumes at `offset`, so a
+  // partially served getrandom() is topped up rather than restarted.
   const int fd = ::open("/dev/urandom", O_RDONLY);
   if (fd < 0) {
     return false;
   }
-  auto* out = static_cast<std::uint8_t*>(buf);
-  std::size_t offset = 0;
   while (offset < len) {
     const ssize_t got = ::read(fd, out + offset, len - offset);
     if (got < 0) {

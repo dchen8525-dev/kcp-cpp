@@ -66,6 +66,11 @@
       "name": "linux-x64-debug",
       "configurePreset": "linux-x64",
       "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "linux-x64-release",
+      "configurePreset": "linux-x64-release",
+      "output": { "outputOnFailure": true }
     }
   ]
 }

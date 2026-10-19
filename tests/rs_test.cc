@@ -38,10 +38,6 @@ using kcp::test::HexToBytes;
 using kcp::test::JsonValue;
 using kcp::test::LoadJsonFile;
 
-std::string Indexed(const char* label, std::size_t index) {
-  return std::string(label) + "[" + std::to_string(index) + "]";
-}
-
 bool ToShardSet(const JsonValue& array, ShardSet* out) {
   out->clear();
   for (const JsonValue& item : array.array_value) {

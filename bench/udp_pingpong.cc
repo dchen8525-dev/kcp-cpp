@@ -27,7 +27,6 @@ using Clock = std::chrono::steady_clock;
 
 // Binds a UDP socket to 127.0.0.1:0 and reports the address it actually got.
 bool BindLoopback(kcp::platform::SocketHandle* fd, kcp::platform::SocketAddress* addr) {
-  std::error_code ec;
   *fd = kcp::platform::SysSocketUdp();
   if (*fd == kcp::platform::kInvalidSocket) {
     return false;

@@ -8,8 +8,11 @@
 // loses the tail on grow stalls a transfer, and a heap that compares with plain operator< breaks
 // once the sequence number wraps, which takes 49 days to show up in the field.
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <deque>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -184,6 +187,86 @@ void TestPeekIsNonDestructive() {
   CHECK_EQ(value, 33);
 }
 
+void TestRingBufferAgainstModel() {
+  // Randomized differential test against std::deque. The fixed sequences above walk a handful of
+  // wrap/grow paths; this walks thousands of interleavings of them, which is where an off-by-one in
+  // the wrapped arithmetic actually shows up. The model is deliberately blind to the ring's
+  // internals: it only knows push appends, pop takes the front, discard drops from the front.
+  RingBuffer<int> ring(8);
+  std::deque<int> model;
+  std::mt19937 rng(0xC0FFEEu);
+  int next_value = 0;
+  int content_checks = 0;
+
+  for (int step = 0; step < 20000; ++step) {
+    // The mix is deliberately push-heavy: with a symmetric mix the queue keeps draining to empty
+    // and the growth paths (which is where the wrapped copy happens) are never reached at all.
+    const unsigned op = rng() % 24u;
+    if (op < 14u) {
+      ring.Push(next_value);
+      model.push_back(next_value);
+      ++next_value;
+    } else if (op < 19u) {
+      int got = -1;
+      const bool popped = ring.Pop(&got);
+      CHECK_EQ(popped, !model.empty());
+      if (popped) {
+        CHECK_EQ(got, model.front());
+        model.pop_front();
+      }
+    } else if (op < 22u) {
+      const std::size_t want = rng() % 3u;
+      const std::size_t dropped = ring.Discard(want);
+      const std::size_t expect = want < model.size() ? want : model.size();
+      CHECK_EQ(dropped, expect);
+      for (std::size_t i = 0; i < expect; ++i) {
+        model.pop_front();
+      }
+    } else if (op == 22u) {
+      if (model.empty()) {
+        CHECK(ring.Peek() == nullptr);
+      } else {
+        CHECK(ring.Peek() != nullptr && *ring.Peek() == model.front());
+      }
+    } else if (model.size() < 32u) {
+      // Clear only while the ring is small, otherwise it would destroy the length the growth
+      // paths need to reach.
+      ring.Clear();
+      model.clear();
+    }
+
+    // Structural invariants the queue consumers rely on, checked every step.
+    CHECK_EQ(ring.Len(), model.size());
+    CHECK_EQ(ring.IsEmpty(), model.empty());
+    CHECK_EQ(ring.IsFull(), ring.Len() == ring.MaxLen());
+    CHECK(ring.MaxLen() >= ring.Len());
+
+    // Full content comparison, forward and reverse, every so often.
+    if (step % 53 == 0) {
+      std::vector<int> forward;
+      ring.ForEach([&forward](int& value) {
+        forward.push_back(value);
+        return true;
+      });
+      std::vector<int> reverse;
+      ring.ForEachReverse([&reverse](int& value) {
+        reverse.push_back(value);
+        return true;
+      });
+      std::vector<int> expected(model.begin(), model.end());
+      CHECK(forward == expected);
+      std::reverse(expected.begin(), expected.end());
+      CHECK(reverse == expected);
+      ++content_checks;
+    }
+  }
+
+  CHECK(content_checks > 0);
+  // The run must actually have grown the ring well past its initial capacity, otherwise it is
+  // testing the same paths the fixed tests already cover.
+  CHECK(ring.MaxLen() >= 1024u);
+}
+
 void TestHeapOrdering() {
   SegmentHeap heap;
   for (std::uint32_t sn : {3u, 1u, 2u}) {
@@ -266,6 +349,7 @@ int main() {
   TestDiscard();
   TestIterationOrder();
   TestPeekIsNonDestructive();
+  TestRingBufferAgainstModel();
   TestHeapOrdering();
   TestHeapWraparound();
   TestHeapMarks();
