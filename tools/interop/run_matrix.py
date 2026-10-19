@@ -151,8 +151,13 @@ def run_client(path: Path, addr: str, args: list[str], which: str) -> dict:
         "-timeout",
         "30s" if which == "go" else "30000",
     ]
-    proc = subprocess.run(command, capture_output=True, text=True, timeout=120)
-    result: dict = {"exit": proc.returncode, "stderr": proc.stdout.strip()}
+    try:
+        proc = subprocess.run(command, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        # A hung client fails this cell, not the whole matrix: the other 15 cells still deserve
+        # their rounds, and the exit code is still non-zero through the cell verdict.
+        return {"exit": -1, "output": f"{which} client timed out after 120s"}
+    result: dict = {"exit": proc.returncode, "output": proc.stdout.strip()}
     for line in proc.stdout.splitlines():
         match = RESULT_RE.match(line.strip())
         if match:
@@ -163,9 +168,9 @@ def run_client(path: Path, addr: str, args: list[str], which: str) -> dict:
 def check(want: str, got: dict, which: str) -> str:
     """Returns an empty string on success, or a failure description."""
     if got.get("exit") != 0:
-        return f"{which} client exit {got['exit']}: {got['stderr'][:200]}"
+        return f"{which} client exit {got['exit']}: {got['output'][:200]}"
     if got.get("ok") != "1":
-        return f"{which} client reported failure: {got['stderr'][:200]}"
+        return f"{which} client reported failure: {got['output'][:200]}"
     if got.get("sha256") != want:
         return f"{which} digest {got.get('sha256')} != expected {want}"
     if int(got.get("bytes", -1)) != PAYLOAD_SIZE:
@@ -200,6 +205,9 @@ def main() -> int:
         help="capture the first datagram of both peers per cell and assert they are byte-identical",
     )
     args = parser.parse_args()
+    if args.rounds < 1:
+        # Zero rounds would mark every cell PASS without running a single client.
+        parser.error("--rounds must be at least 1")
 
     want = expected_digest()
     tools = {"cpp": locate("cpp"), "go": locate("go")}

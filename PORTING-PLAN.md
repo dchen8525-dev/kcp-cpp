@@ -1,6 +1,6 @@
 # kcp-cpp 移植计划 v5.12（参考 xtaci/kcp-go v5）
 
-> 状态：**实施中**（v5.14，累计 25 轮对抗分析（风险表 R1~R27）+ 命名合规审计 + 源码逐行核验 + 用户决策；**P0 ~ P8.0 已完成**，P8.1~P8.6 触发条件均未满足，仅剩 Linux 实机回归（E1），见 §6）  
+> 状态：**实施中**（v5.15，累计 26 轮对抗分析（风险表 R1~R28）+ 命名合规审计 + 源码逐行核验 + 用户决策；**P0 ~ P8.0 已完成**，P8.1~P8.6 触发条件均未满足，仅剩 Linux 实机回归（E1），见 §6）  
 > 目标：将 D:\work\kcp-go（Go）完整移植为 C++17 库，输出到 D:\work\kcp-cpp，零第三方依赖。  
 > 已确认决策：① 加密层自包含实现；② Reed-Solomon 自实现；③ 验收含跨语言互通；  
 > ④ **定位 = 全量独立库**（含 session 层，与 kcp-proxy-cpp 解耦，集成另行议）；  
@@ -1186,6 +1186,7 @@ socket RAII（**platform/socket 双实现**，决策⑤）→ ringbuffer/`Blocki
 | R25 | **`write_buffers` 批次字节数 int 溢出**（单批 >2 GB：`total += static_cast<int>(view.len)` 有符号溢出（UB），回绕负值冒充成功字节数；上游 Go 的 int 为 64 位会接受该批次） | 批次总量以 `size_t` 预累加 + 预检，超 INT_MAX 一律 `kInvalidArgument`：不入队、不持锁、会话保持可用（>2 GB 的 KCP 报文在 UDP 上本不可达，确定化拒绝是安全移植）。`TestWriteBuffersRejectsOversizedBatch` 用 `nullptr` + `INT_MAX+1` 长度做零分配回归，并验证拒绝后普通写入仍可达对端 |
 | R26 | **"声明了但没人写"的仪器化死代码**（P8.0 引入 `TimedSched::cpu_us_`：头文件注释称"每任务后重发布"，`cpu_us()` 访问器齐全，但全仓无任何写入点，恒返回 0；session 的 update CPU 已由 `update_cpu_us_`（CpuScope 在回调内）覆盖，该成员纯冗余） | 删除成员 + 访问器 + 失效注释与 `profile.h` 包含；由变异测试方法学发现——**对修复做变异验证测试有效性**时逐一核对"文档声明的行为是否有代码兑现"。教训：仪器化代码的文档声明（计数器语义、发布时机）必须与写入点一起 review，否则留下恒零的"测量" |
 | R27 | **测试覆盖的"形状缺口"**（`write_buffers` 超限预检只测了单缓冲区 >INT_MAX；把预检退化成逐块检查的变异可存活——多块各合法、总和超限的批次会被放行后 Crash） | 补两个零分配用例：① 2 × (INT_MAX/2+1) 多缓冲区累加超限（同样期望 `kInvalidArgument`）② 空批次返回 0/kOk（上游亦无早退，钉住当前语义）。变异验证：逐块检查变异 → SEGFAULT 被杀；删除预检 → SEGFAULT 被杀；发送循环双重计数（run 2 实踩 bug）→ session_test 26 + relay_test 8 失败被杀；`recv_n` 改 `store` → profiling 带断言被杀 |
+| R28 | **测试驱动脚本的静默失败面**（三个 Python 驱动各有一处"坏了却报好"：① `profile_split.py` 的 `PROFILE_RE`/`RESULT_RE` 缺 `re.MULTILINE`，`finditer` 对多行日志只在串边界匹配，折叠**静默退化为最后一行**，分解表整个作废而无任何报错；② `--rounds 0` 折叠零样本后仍退出 0，全部门禁 vacuous pass；③ 客户端超时后进程泄漏，占住端口与被计价的 CPU；④ 折叠输入允许没有 RESULT 或携带 ok=0——失败运行的计数器不是有效会话的分解；⑤ `run_matrix.py` 单格挂起抛 `TimeoutExpired` 炸掉整个矩阵，其余 15 格失去参评资格） | ① regex 补 `re.MULTILINE`；② 三脚本统一 `--rounds >= 1`（`profile_split`/`run_bench` 另加 `--mb >= 1`）预检，`parser.error` 退出 2；③ 超时路径先 `kill()` + `wait()` 再退出；④ 折叠路径强制 RESULT 存在且逐条 ok=1；⑤ 单格超时记 `exit=-1` 走格子 FAIL 判定，其余格子照跑。另加 **`tx_n ≥ out_pkts` 对账门**：`SysSendTo` 全仓唯一调用点在 `UdpSession::Tx`，snmp `out_pkts` 计成功、`io_.send_n` 计全部，且 PROFILE 快照在 close() join post 线程之后取——tx_n 更小即计数器 bug，更大即发送实际失败。验证（2026-10-19）：两轮折叠正确展开、ok=0/无 RESULT 均拒收、`--rounds 0`/`--mb 0` 均退出 2；实测路径门禁全过；16 格矩阵 `--rounds 1` 16/16；`run_bench --impl cpp --rounds 2` 冒烟通过 |
 
 ---
 

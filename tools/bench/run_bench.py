@@ -12,7 +12,7 @@ snd/rcv window 32/32, same cipher and FEC tuple.
 
 Usage:
   python tools/bench/run_bench.py                    # full matrix, 5 rounds
-  python tools/bench/run_bench.py --rounds 1 --quick # smoke the harness
+  python tools/bench/run_bench.py --rounds 1 --impl cpp # smoke the harness
   python tools/bench/run_bench.py --impl cpp         # only the C++ half
 
 Writes bench.md at the repository root (the file README links to) and prints a summary.
@@ -223,8 +223,16 @@ def run_client(impl: Impl, addr: str, config: tuple[str, int, int], mb: int, ite
     ]
     proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
     sampler = CpuSampler(proc.pid).start()
-    out, _ = proc.communicate(timeout=300)
-    cpu_ms = sampler.stop()
+    try:
+        out, _ = proc.communicate(timeout=300)
+    except subprocess.TimeoutExpired:
+        # Kill the client before unwinding: a leaked echo_client keeps the port and the CPU, and
+        # the sampler thread outlives the process it was pricing.
+        proc.kill()
+        proc.wait()
+        raise SystemExit(f"run_bench: {impl.name} client timed out after 300s")
+    finally:
+        cpu_ms = sampler.stop()
     result: dict = {"cpu_ms": cpu_ms}
     for line in out.splitlines():
         match = RESULT_RE.match(line.strip())
@@ -312,7 +320,7 @@ def summarize(samples: list[dict]) -> dict:
     }
 
 
-def calibration(which: str) -> dict:
+def calibration() -> dict:
     """Engine-only, platform-only and AES-only numbers that explain the session result."""
     suffix = ".exe" if os.name == "nt" else ""
     bases = [
@@ -382,7 +390,8 @@ def render_markdown(table: dict, calib: dict, rounds: int) -> str:
         "(1, 10, 2, 1), snd/rcv window 32/32, loopback on this machine.",
         "",
         f"Rounds per cell: {rounds} (first round dropped as warm-up), median reported with min/max.",
-        "CPU is the client side only, as a percentage of one core over the run.",
+        "CPU is the client side only: the single-stream row is one client's share of a single core;",
+        "the concurrent row sums all clients over wall time, so it can exceed 100%.",
         "",
         "## Session throughput",
         "",
@@ -488,6 +497,10 @@ def main() -> int:
     parser.add_argument("--out", default=str(ROOT / "bench.md"))
     parser.add_argument("--json", default="", help="also write the raw table here")
     args = parser.parse_args()
+    if args.rounds < 1:
+        # A zero-round run would summarize no samples: median([]) raises and every gate below it
+        # never runs, which is a crash rather than a result - refuse it up front instead.
+        parser.error("--rounds must be at least 1")
 
     impls = []
     if args.impl in ("cpp", "both"):
@@ -514,7 +527,7 @@ def main() -> int:
                     )
                 table[key][impl.name] = summarize(samples)
 
-    calib = calibration("cpp")
+    calib = calibration()
     markdown = render_markdown(table, calib, args.rounds)
     Path(args.out).write_text(markdown, encoding="utf-8")
     if args.json:

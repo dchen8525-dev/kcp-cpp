@@ -18,8 +18,12 @@ What it checks (the P8.0 gate, "the books must add up"):
      wake-up on top. That wake-up is ~1 us on an idle machine and grows past 2x when the peer is
      descheduled by concurrent load, which is a WARN, not a counter bug.
   3. Sanity: rx_n >= tx_n (an echo answers every datagram, sometimes with duplicates counted),
-     and probe_n inside [rx_n - 2, rx_n] - ReadLoop probes *after* each receive to decide whether
-     to keep draining, so the window's slack is exactly one close() race plus one EWOULDBLOCK.
+     probe_n inside [rx_n - 2, rx_n] - ReadLoop probes *after* each receive to decide whether
+     to keep draining, so the window's slack is exactly one close() race plus one EWOULDBLOCK -
+     and tx_n >= out_pkts: there is exactly one SysSendTo call site (UdpSession::Tx), snmp's
+     out_pkts counts the successful calls and io_.send_n counts every call, so a smaller tx_n
+     is a counter bug, and a gap means sends actually failed. --fold input must carry RESULT
+     ok=1 lines like the measured path does, and --rounds must be at least 1.
 
 Usage:
   # measure: starts a server, runs the client with -profile, folds and checks
@@ -45,8 +49,11 @@ import threading
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-PROFILE_RE = re.compile(r"^PROFILE\s+(.*)$")
-RESULT_RE = re.compile(r"^RESULT\s+(.*)$")
+# MULTILINE matters: finditer() runs these against the whole folded text, and without it ^ and $
+# only match at the string boundaries, so a two-line log matched nothing and every fold silently
+# degraded to the last line (the pre-MULTILINE fallback hid it).
+PROFILE_RE = re.compile(r"^PROFILE\s+(.*)$", re.MULTILINE)
+RESULT_RE = re.compile(r"^RESULT\s+(.*)$", re.MULTILINE)
 KV_RE = re.compile(r"(\w+)=(\S+)")
 CONFIGS = {
     "none": ("none", 0, 0),
@@ -77,6 +84,15 @@ def fold(profile: dict[str, str], result: dict[str, str] | None) -> dict[str, fl
     out_pkts = f["out_pkts"]
     if out_pkts <= 0:
         raise SystemExit("profile_split: out_pkts=0, nothing to divide by")
+    if f["proc_cpu_us"] <= 0:
+        # GetProcessTimes (Windows) and CLOCK_PROCESS_CPUTIME_ID quantise: a window shorter than
+        # one scheduler tick (~15.6 ms on Windows) reads exactly 0, and every closure ratio below
+        # divides by it. P8.0 measured this pitfall (a 120 ms window reported +33% closure); the
+        # fix is a longer run, so refuse with that instruction instead of a traceback.
+        raise SystemExit(
+            "profile_split: proc_cpu_us=0, the window is shorter than the process-clock tick "
+            "(~15.6 ms); re-run with a larger --mb so the window lasts >= 1 s"
+        )
 
     def per(key: str, n: float = out_pkts) -> float:
         return f[key] / n
@@ -203,6 +219,11 @@ def measure(config: tuple[str, int, int], mb: int, iters: int, port: int) -> tup
             text=True,
         )
         out, _ = proc.communicate(timeout=300)
+    except subprocess.TimeoutExpired:
+        # Kill the client before unwinding: a leaked echo_client keeps the port and the CPU.
+        proc.kill()
+        proc.wait()
+        raise SystemExit("profile_split: client timed out after 300s")
     finally:
         server.terminate()
         try:
@@ -295,6 +316,14 @@ def render(f: dict[str, float], prices: dict[str, float], tol_pct: float,
         f"(tolerance {tol_pct:.0f}%).",
     ]
     verdicts: list[str] = []
+    if f["proc_cpu_us"] < 1_000_000:
+        # Not a failure: the books can still close on a short window, but the process clock's
+        # ~15.6 ms tick is a large fraction of it, so the percentage is noisy by construction
+        # (P8.0 saw +33% on a 120 ms window). Say so instead of letting the number be quoted.
+        verdicts.append(
+            f"note: window is {f['proc_cpu_us'] / 1000:.0f} ms of process CPU; closure below "
+            "~1 s is unreliable (process-clock tick ~15.6 ms)"
+        )
     if abs(f["cpu_closure_pct"]) > tol_pct:
         verdicts.append(
             f"CLOSURE FAIL: buckets are {f['cpu_closure_pct']:+.1f}% off process CPU "
@@ -311,6 +340,20 @@ def render(f: dict[str, float], prices: dict[str, float], tol_pct: float,
             f"SANITY FAIL: probe_n {f['probe_n']:.0f} vs rx_n {f['rx_n']:.0f} outside the drain "
             "pattern's [rx_n - 2, rx_n] (ReadLoop probes after each receive; the slack covers one "
             "close() race and one EWOULDBLOCK)"
+        )
+    # One SysSendTo call site (UdpSession::Tx): snmp out_pkts counts the successful calls and
+    # io_.send_n counts every call, and the PROFILE snapshot is taken after close() joins the
+    # post thread, so the two are directly comparable. A smaller tx_n is impossible; a gap means
+    # sends actually failed (tx_err is not on the PROFILE line).
+    if f["tx_n"] < f["out_pkts"]:
+        verdicts.append(
+            f"SANITY FAIL: tx_n {f['tx_n']:.0f} < out_pkts {f['out_pkts']:.0f} (every "
+            "snmp-counted datagram went through SysSendTo; a smaller tx_n is a counter bug)"
+        )
+    elif f["tx_n"] > f["out_pkts"]:
+        verdicts.append(
+            f"note: tx_n {f['tx_n']:.0f} > out_pkts {f['out_pkts']:.0f}: "
+            f"{f['tx_n'] - f['out_pkts']:.0f} datagram send(s) failed (tx_err not printed)"
         )
     for name, measured, price in (
         ("sendto", f["tx_us_per_call"], prices.get("sendto_us")),
@@ -365,6 +408,11 @@ def main() -> int:
         help="re-fold saved output instead of measuring; '-' reads stdin",
     )
     args = parser.parse_args()
+    if args.rounds < 1:
+        # A zero-round run would fold nothing and still exit 0: every gate "passed" vacuously.
+        parser.error("--rounds must be at least 1")
+    if args.mb < 1:
+        parser.error("--mb must be at least 1")
 
     prices = syscall_prices()
     if not prices:
@@ -391,6 +439,19 @@ def main() -> int:
             # A fold file may hold several rounds; fold every PROFILE line it contains.
             profiles = [parse_kv(m.group(1)) for m in PROFILE_RE.finditer(text)]
             results = [parse_kv(m.group(1)) for m in RESULT_RE.finditer(text)]
+            # The measured path refuses to fold a failed client (measure() demands ok=1), so a
+            # re-folded log must carry the same evidence: a failed run's counters are not a
+            # decomposition of a working session and must not pass the gates.
+            if not results:
+                raise SystemExit(
+                    "profile_split: folded input has no RESULT line; the measured path requires ok=1"
+                )
+            for folded in results:
+                if folded.get("ok") != "1":
+                    raise SystemExit(
+                        "profile_split: folded input holds a failed RESULT (ok=0); the measured "
+                        "path stops at the first such run instead of folding it"
+                    )
         else:
             profiles, results = [], []
 

@@ -30,6 +30,10 @@ tools/golden/overlay.json
 tools/interop/**/*.exe
 tools/interop/**/*.test
 
+# Python bytecode caches (the tools/ harness scripts)
+__pycache__/
+*.pyc
+
 # Test runtime artifacts
 *.log
 Testing/
