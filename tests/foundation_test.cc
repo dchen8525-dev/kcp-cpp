@@ -6,6 +6,7 @@
 // every session, so the invariants checked here (exact buffer size, rejected size mismatch, counter
 // ordering matching the header names) are what keeps later stages from corrupting shared state.
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -13,6 +14,7 @@
 
 #include "kcp/internal/bufferpool.h"
 #include "kcp/internal/constants.h"
+#include "kcp/internal/rate_limiter.h"
 #include "kcp/snmp.h"
 
 namespace {
@@ -120,11 +122,39 @@ void TestSnmp() {
   CHECK(&kcp::DefaultSnmp() == &kcp::DefaultSnmp());
 }
 
+void TestRateLimiter() {
+  using kcp::internal::RateLimiter;
+
+  // Unlimited (rate 0 == rate.Inf): acquiring any amount is a no-op.
+  RateLimiter unlimited(0);
+  CHECK(unlimited.unlimited());
+  unlimited.Acquire(1u << 30);
+
+  const double burst = static_cast<double>(kcp::kMaxBatchSize * kcp::kMtuLimit);
+  CHECK(burst == 96000.0);
+
+  // Drain the bucket with one burst-sized request (the initial token count is the burst), then ask
+  // for one byte more. x/time/rate.WaitN rejects a request over the burst without reserving a
+  // token, so sess.go transmits it immediately; blocking to refill a whole burst here would cost
+  // burst/rate = ~96s at 1 kB/s. A generous 2s bound separates "immediate" from "waited".
+  RateLimiter limited(1000);
+  CHECK(!limited.unlimited());
+  limited.Acquire(static_cast<std::size_t>(burst));
+
+  const auto start = std::chrono::steady_clock::now();
+  limited.Acquire(static_cast<std::size_t>(burst) + 1);
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - start)
+                           .count();
+  CHECK(elapsed < 2000);
+}
+
 }  // namespace
 
 int main() {
   TestBufferPool();
   TestSnmp();
+  TestRateLimiter();
 
   if (g_failures != 0) {
     std::fprintf(stderr, "foundation_test: %d failure(s)\n", g_failures);

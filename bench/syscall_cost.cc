@@ -101,7 +101,7 @@ namespace {
 //             path looks like, and it is what IOCP would give P8.
 //
 // Returns microseconds per datagram, or a negative value when the count could not be met.
-double OverlappedSendCost(kcp::platform::SocketHandle rx, const kcp::platform::SocketAddress& dest,
+double OverlappedSendCost(const kcp::platform::SocketAddress& dest,
                           const std::vector<std::uint8_t>& payload, int count, bool wait_each,
                           std::size_t* completed, double* cpu_us) {
   SOCKET sock = ::WSASocketW(AF_INET, SOCK_DGRAM, IPPROTO_UDP, nullptr, 0, WSA_FLAG_OVERLAPPED);
@@ -308,7 +308,9 @@ int main(int argc, char** argv) {
   // a whole tick. Every send phase therefore runs send_iters times: long enough for the fast paths
   // to register, short enough to keep the tool under two seconds.
   const int send_iters = drain * 8;
+#if defined(_WIN32)
   const double sendto_cpu_start = CpuMicros();
+#endif
   std::size_t sent = 0;
   t0 = Clock::now();
   for (int i = 0; i < send_iters; ++i) {
@@ -317,7 +319,9 @@ int main(int argc, char** argv) {
     }
   }
   const double sendto_deep = MicrosPerCall(Clock::now() - t0, static_cast<std::size_t>(send_iters));
+#if defined(_WIN32)
   const double sendto_cpu = (CpuMicros() - sendto_cpu_start) / static_cast<double>(send_iters);
+#endif
 
   std::size_t received = 0;
   t0 = Clock::now();
@@ -382,9 +386,9 @@ int main(int argc, char** argv) {
   double ov_sync_cpu = 0.0;
   double conn_cpu = 0.0;
   const double ov_waited =
-      OverlappedSendCost(rx, rx_addr, payload, send_iters, true, &ov_done, &ov_cpu);
+      OverlappedSendCost(rx_addr, payload, send_iters, true, &ov_done, &ov_cpu);
   const double ov_pending =
-      OverlappedSendCost(rx, rx_addr, payload, send_iters, false, &ov_done, &ov_pending_cpu);
+      OverlappedSendCost(rx_addr, payload, send_iters, false, &ov_done, &ov_pending_cpu);
   const double ov_sync = SyncPointerSendCost(rx_addr, payload, send_iters, &ov_done, &ov_sync_cpu);
   const double conn_send = ConnectedSendCost(rx_addr, payload, send_iters, &conn_done, &conn_cpu);
   std::printf(

@@ -22,8 +22,9 @@ namespace internal {
 // each transmit; a non-positive rate is rate.Inf, i.e. unlimited.
 //
 // WaitN's error is discarded in the reference ("only returns error if the limiter is
-// misconfigured"), which in practice means a request larger than the burst is let through after
-// the bucket empties. This implementation clamps the request to the burst for the same reason.
+// misconfigured"), and a request larger than the burst is exactly such a case: WaitN returns
+// without reserving a token, so the oversized batch is transmitted immediately. This implementation
+// mirrors that early-out rather than blocking for a full burst.
 class RateLimiter {
  public:
   // bytes_per_second == 0 means unlimited.

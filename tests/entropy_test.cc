@@ -35,23 +35,30 @@ void TestLengthAndNonZero() {
   // round them up or down.
   for (std::size_t len :
        {std::size_t{1}, std::size_t{12}, std::size_t{16}, std::size_t{37}, std::size_t{1500}}) {
-    std::vector<std::uint8_t> buffer(len + 8, 0xAA);  // canary past the requested length
-    const bool ok = kcp::platform::FillRand(buffer.data(), len);
-    CHECK(ok);
+    // A one-byte draw from a real entropy source is zero with probability 1/256, so asserting a
+    // single such draw is non-zero made this test fail once per ~256 gate runs - it really did fail
+    // a Release gate run, which is what a flaky gate costs: a green build reported as broken. For
+    // that length, draw a batch and require at least one non-zero byte (2^-512 of flaking); the
+    // longer draws keep the direct single-draw check, whose failure probability is already 2^-96.
+    const int draws = len == 1 ? 64 : 1;
+    bool saw_nonzero = false;
+    for (int d = 0; d < draws; ++d) {
+      std::vector<std::uint8_t> buffer(len + 8, 0xAA);  // canary past the requested length
+      CHECK(kcp::platform::FillRand(buffer.data(), len));
 
-    bool all_zero = true;
-    for (std::size_t i = 0; i < len; ++i) {
-      if (buffer[i] != 0) {
-        all_zero = false;
-        break;
+      for (std::size_t i = 0; i < len; ++i) {
+        if (buffer[i] != 0) {
+          saw_nonzero = true;
+          break;
+        }
+      }
+
+      // Bytes past the requested range must be untouched.
+      for (std::size_t i = len; i < buffer.size(); ++i) {
+        CHECK(buffer[i] == 0xAA);
       }
     }
-    CHECK(!all_zero);
-
-    // Bytes past the requested range must be untouched.
-    for (std::size_t i = len; i < buffer.size(); ++i) {
-      CHECK(buffer[i] == 0xAA);
-    }
+    CHECK(saw_nonzero);
   }
 }
 
