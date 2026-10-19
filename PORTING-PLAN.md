@@ -1,6 +1,6 @@
 # kcp-cpp 移植计划 v5.12（参考 xtaci/kcp-go v5）
 
-> 状态：**实施中**（v5.15，累计 26 轮对抗分析（风险表 R1~R28）+ 命名合规审计 + 源码逐行核验 + 用户决策；**P0 ~ P8.0 已完成**，P8.1~P8.6 触发条件均未满足，仅剩 Linux 实机回归（E1），见 §6）  
+> 状态：**实施中**（v5.16，累计 36 轮对抗分析（风险表 R1~R31）+ 命名合规审计 + 源码逐行核验 + 用户决策；**P0 ~ P8.0 已完成**，P8.1~P8.6 触发条件均未满足，Linux 实机回归（E1）已通过，见 §6）  
 > 目标：将 D:\work\kcp-go（Go）完整移植为 C++17 库，输出到 D:\work\kcp-cpp，零第三方依赖。  
 > 已确认决策：① 加密层自包含实现；② Reed-Solomon 自实现；③ 验收含跨语言互通；  
 > ④ **定位 = 全量独立库**（含 session 层，与 kcp-proxy-cpp 解耦，集成另行议）；  
@@ -203,6 +203,39 @@
 | **144**   | **A4 FEC/RS 解码**：`FECShardSet` 同时被 `fetch_add`（建 set）与 `store`（`discardShards` 末）写——上游 fec.go 逐字同款（Add 恒被随后的 Store 覆盖，实为 gauge），C++ 已有注释，不动作；`ShardHeap::Push` 不去重由调用方 `Has` 先行——与上游一致；`seqid >= paws` 早退与上游一致；auto-tune（`shouldTune`）不实现为已登记决策 #108；RS `ReconstructImpl` 的 MDS 子矩阵选择与行变换数学验证正确。**未发现缺陷** | 实测    |
 | **145**   | **A5 Crypt/platform/构建**：GCM tag 比较为常量时间（`ConstantTimeEqual`）且先验证后解密；nonce 每包 `FillRand`（BCryptGenRandom→getrandom→/dev/urandom→响亮告警的 splitmix64 降级）；CFB 校验和覆盖范围与 sess.go:735 一致；`SocketAddress::mutable_size()` 返回全容量 128（v6 peer 不会被静默丢弃）；`/W4` 全量零警告。**未发现缺陷** | 实测    |
 | **146**   | **方法论固化**：变异测试作为修复的验收环节——"改了安全代码"必须回答"哪个测试能在回归时失败"。本轮同时示范了变异存活的诚实处置（R24 的 UB 修复无单跑可观察行为，记录而非伪装成被测试保护） | 方法论  |
+
+---
+
+### v5.14 → v5.15 修订摘要（E1 Linux 实机验证，非分析轮次）
+
+**任务判定**：用户提供 Linux 实机（Ubuntu 22.04.5、g++ 11.4、cmake 3.22.1、ninja 1.10.1），E1 由"环境阻塞"变为可执行 → 本轮无分析、只做验证与修复。
+
+| 编号      | 修订                                                                                                                                                                                                                                                                                                                  | 依据   |
+| ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---- |
+| **147** | **Linux 构建首次实跑，暴露 4 处"该分支从未被编译器看过"的漏检**：① `platform/entropy_backend.cc` 的 `getrandom` 分支与 `/dev/urandom` 回退块重复声明 `out`/`offset` → **编译失败**（MSVC 不编译该分支，故 Windows 侧永远看不见）；② `bench/udp_pingpong.cc` 未使用的 `std::error_code`（MSVC 传递包含 `<system_error>` 掩盖）；③ `bench/syscall_cost.cc` 的 `CpuMicros()` 只有 Windows 实现而调用点无条件调用 → POSIX 编译失败；④ `CMakePresets.json` 缺 `linux-x64-release` test preset → `build.sh Release` 必在 `ctest` 处失败 | 实测   |
+| **148** | **修复后新增警告的二次处置**：`CpuMicros` 在 POSIX 无调用者（`-Wunused-function`）→ 定义与两处调用点一并收拢到 `_WIN32`；`SysRecvFrom` 的 `socklen_t`(unsigned) 与 `int` 比较（`-Wsign-compare`）→ 改用 `std::size_t` 同类型比较（截断式越界检查不再有符号性歧义）；另删 `rs_test.cc` 中全仓无引用的 `Indexed()` | 实施   |
+| **149** | **E1 门禁（Linux 实机，2026-10-19）**：`build.sh Debug` 与 `build.sh Release` 全量重建均 **16/16 全绿、零警告**（`-Wall -Wextra -Wpedantic`）；`check_guard` 29 头、`check_format` 80 文件全绿；C++↔C++ 回环冒烟四种 cipher（none/aes/aes-gcm/salsa20，FEC 10/3）**全部 `ok=1`**，载荷 SHA-256 一致、`retrans=0 lost=0`。**未做**：Linux 侧跨语言 16 格矩阵（需 Go 1.24 工具链 + `kcp-go` 检出，见 R29 备注） | 实测   |
+| **150** | **新风险 R29**：双平台分支只有一侧被编译过 → 另一侧长期潜伏语法/语义错误，且**只在换平台时才暴露**。缓解已从"待环境"变为"已解阻"：每个平台提交前各跑一次真实构建（Windows `build.bat` / Linux `build.sh`）+ 门禁 | 方法论  |
+
+---
+
+### v5.15 → v5.16 修订摘要（第 26~35 轮对抗分析）
+
+**任务判定**：E1 已闭环，P8.1~P8.6 触发条件复算仍未满足 → 按用户规则继续 10 轮对抗分析（第 26~35 轮）。每轮选定一个尚未覆盖的攻击面，与 `d:\work\kcp-go` 参考实现逐行对照，只报告**可实测/可推证的真实缺陷**，修复后以变异或实机复跑验收，并登记本表。
+
+| 编号    | 修订                                                                                                                                                                                                                                                                                                             | 依据   |
+| ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---- |
+| **151** | **第 26 轮 ringbuffer 不变量**：`ringbuffer.go` 与 `RingBuffer` / `SegmentHeap`（`kcp.go:162-198`）逐行对照，语义 1:1 一致。**未发现产品缺陷**；但既有的定点用例只覆盖了少量 wrap/grow 路径 → 新增 `TestRingBufferAgainstModel()`：以 `std::deque` 为模型跑 20000 步 push-heavy（`rng()%24`）随机差分，逐步断言 `Len/IsEmpty/IsFull/MaxLen`，每 53 步做 `ForEach`/`ForEachReverse` 全量内容比对，末态断言 `MaxLen() >= 1024u`（确保确实触发了增长分支与回绕拷贝） | 实测   |
+| **152** | **第 27 轮 KCP 常量与状态机**：`include/kcp/internal/constants.h` 对 `kcp.go:32-64` 逐值核对；`src/kcp.cc` 的 `Flush/Input/Update/Check/ParseAck/ParseFastack/ParseUna/ParseData/Send/Recv/PeekSize/UpdateAck/ShrinkBuf/NoDelay/WndSize/SetMtu` 对 `kcp.go` 逐一等价核验。**未发现缺陷**。两处非缺陷经证实：① C++ `Flush` 丢弃 Go 未使用的 `nextUpdate` 返回值（Go 的 `Update`/`Input` 本就忽略它）→ 契约一致；② `buffer_ = (mtu+kOverhead)*3` 对 Go `mtu*3`——更大且无害，`ensure_capacity` 增长路径已在 L899 登记为偏差 | 实测   |
+| **153** | **第 28 轮 SNMP 记账完整性**：`src/snmp.cc` / `include/kcp/snmp.h` 对 `snmp.go` 逐条核对——`HeaderNames()` 与 `ToArray()` 的 **30 个字段顺序、标签拼写**（含易错的 `FECFullShards` 对应的成员名 `FECFullShardSet`）完全一致；`udp_session.cc` / `listener.cc` 的全部自增点与 `sess.go`、`tx.go` 逐点对齐（active/passive opens、curr_estab/max_conn、bytes_received ×3 路径、bytes_sent、curr_estab--、in_csum_errors、kcp_in_errors ×3、in_pkts/in_bytes、in_errs、oob_packets、out_pkts/out_bytes）。**未发现缺陷**；唯一偏离为已登记的 #117（监听器/会话读循环对可忽略 recv 错误 `Bump(in_errs)` 后继续，Go 直接 return 杀线程），`foundation_test::TestSnmp` 钉住表序 | 实测   |
+| **154** | **第 29 轮 FEC 解码链与 shard 堆边界**：`src/internal/fec.cc` 对 `fec.go` 逐行等价——`ShardHeap` 升序插入 / `Pop` / `TakeAll` 语义、8 个 FEC 计数器位点一一对应（`fec.cc:174↔fec.go:464`、`272↔228`、`280↔238`、`306↔276`、`324↔301`、`326↔310`、`333↔322`、`351↔349`）、`paws`/`next`/`skipParity`/连续性判定/等长零填充/`maxlen` 全部一致。**未发现缺陷**；`auto-tune`（Go 依 `snmp` 速率自适应 shard 数）为有意不实现，已登记 #108 | 实测   |
+| **155** | **第 30 轮 RS / Galois 数学契约**：`src/internal/rs.cc`、`galois.cc` 对 `klauspost/reedsolomon v1.12.0` 核对——`kGaloisPoly=0x11d`、生成元 2、exp/log 表构造一致；`New` 边界（`d≥1,p≥0,d+p≤256`）一致；系统化矩阵 `vm×topInv`、`Reconstruct` 的"前 d 个在场行求逆" MDS 擦除解码正确；`ShardSet` 空 vector 表缺失（与 `fec.cc` 一致）。**未发现缺陷**，且已由金标准 `tools/golden/out/rs.json`（真实 klauspost 生成，见 `golden_ref.go.txt` 的 `rsMatrixHead`/`buildRSVector`）经 `rs_test` **逐字节对拍证实** | 实测   |
+| **156** | **第 31 轮会话/监听器生命周期与并发**：`UdpSession::close` / `Listener::close` / `~Listener` / `Accept` 对 `sess.go:462-491`、`1382-1419`、`1275-1287` 核对——关闭的单次性（`closed_` 于 `mu_` 内 CAS）、`curr_estab--` 位置、`flush(FULL)` 兜底、`post_processing_.Close()` 唤醒与 join、**fd 关闭严格在 read/monitor 线程 join 之后**（POSIX 下 close 一个被 select 的 fd 未定义）、`own_conn_` 才关 fd、`closeSession` 从 map 擦除、listener 关闭时先 join monitor 再逐个 `session->close` 再关 fd、`Accept` 的 `accepts_`/`read_error_`/`closed_`/deadline 四态与 `accept_cv_` 唤醒顺序、`max_conn` 的 CAS 循环。**未发现产品缺陷**（C++ 额外的线程 join 属资源管理重写，见总原则 #36）；`TestListenerCloseClosesSessions`、`TestListenerSurvivesPeerDisappearing` 已覆盖（R22） | 实测   |
+| **157** | **第 32 轮加解密边角**：CFB 残字节（`#43`）、GCM 位序/归约（`#R17`）、TEA/XTEA（`#R18`）、Salsa20、SimpleXor 的边角**已被 P2 金标准完全覆盖**：`crypt_test` 对 `crypt.json` 逐字节对拍（8 种算法 × 对齐 64B / 非对齐 37B 两长度；AES 再经 AES-NI 与 T-table **双后端**各自对拍）、`aes/gcm/salsa20` 独立向量、`TestAeadCapacityContract`（容量不足→`kBufferTooSmall`，短于 tag→`kIntegrityFailed`，篡改 tag→`kIntegrityFailed`）、`TestEmptyInputs`（零长 no-op）、`TestFactoryRejectsBadKeys`（AES 20B / GCM 8B / TEA 15B / XTEA 24B 全拒）。**未发现缺陷**，新增面为零 | 实测   |
+| **158** | **第 33 轮限速器（【真实缺陷】）**：`RateLimiter::Acquire` 对 **超过 burst 的请求**会 clamp 到 burst 并**阻塞等待满桶**，而参考 `x/time/rate.WaitN`（`sess.go:774`，`NewLimiter(rate.Limit(bps), maxBatchSize*mtuLimit)`，`sess.go:649-651`）对 `n > burst && limit != Inf` **先判先返回错误**（不预留任何 token），`sess.go` 丢弃该 error 后照常发送 → 超限批次应立即放行。C++ 实现使 FEC 奇偶校验重的后处理批次（> `maxBatchSize` 包）平白多付 `burst/rate` 延迟（1 kB/s 下约 96 s），**头文件注释还反向宣称"so does this port"**。修复：`Acquire` 前置 `n > burst_` 早退（与 `WaitN` 一致），更正 `rate_limiter.h` 类注释 | `sess.go:649-651,774`；`rate.WaitN` 语义 |
+| **159** | **第 34 轮 POSIX 平台分支语义**：逐条核对 `src/platform/socket.cc` 的 `#else` 分支——`select(sock+1,…)`、`EINTR→0`（让调用方重查 `closed_`）、`EAGAIN/EWOULDBLOCK/ECONNREFUSED/ECONNRESET/EMSGSIZE` 可忽略、`fcntl` 非阻塞、`SO_RCVTIMEO` 的 `timeval`、`socklen_t` 与 Windows `int` 的长度类型分叉、`SysRecvFrom`/`SysGetSockName` 的 128B `sockaddr_storage` 与 `mutable_size()` 边界检查、fd 关闭顺序、`AF_INET` 仅 IPv4 socket（IPv6 目标不支持，由 `Parse` 接受但运行期 `sendto` 失败；非 loopback 矩阵所需）、`SysSetDscp` 对 IPv6 取 `IPV6_TCLASS`/IPv4 取 `IP_TOS=dscp<<2`（与 `ipv4/ipv6.NewConn` 的 `SetTOS(dscp<<2)`/`SetTrafficClass(dscp)` 等价）、`readloop_linux.go` 的 `recvmmsg` 批量路径在 C++ 用 `select`+`recvfrom` 循环等价替代（批大小 `kMaxBatchSize` 对 Go `batchSize=256`，语义等价）。**未发现可推证的缺陷**；两侧真实构建已由 R29 缓解（Linux 实机 E1 已 16/16） | 实测   |
+| **160** | **第 35 轮测试与门禁脚本可判定性（【真实缺陷 ×2】）**：脚本侧——`tools/check_format.py`、`tools/check_guard.py`、`tests/CMakeLists.txt`（16 个 `add_test` 全 `RUN_SERIAL`）**均无"坏了却报好"的静默面**（失败即非 0，`build.bat`/`build.sh` 以 `&&` 短路，空 include 目录即退 1）。但本轮门禁暴露两处**真实缺陷**：① **概率性断言冒充确定性门禁**——`entropy_test.cc` 对 `len=1` 单字节抽样断言 `!all_zero`，失败概率 **1/256**，实测 Release 门禁**真的失败一次**（重跑 20 次命中 1 次，退出码 8）→ 一个全绿构建被误报为坏。修复：`len==1` 改为 64 次抽样、要求至少一次非零（2^-512），长抽样保持单次直检；② `bench/syscall_cost.cc` 的 `OverlappedSendCost`（Windows-only）首参 `rx` 未用 → MSVC `/W4` `C4100`（Linux 不编译该分支故未见），已从签名与两处调用点移除。修复后复测：Windows Release/Debug 各 16/16、`entropy_test` 20/20、`check_guard OK (29 headers)`、`check_format OK (80 files)`；Linux（E1）Debug/Release 各 16/16 零警告 | 实测   |
+| **161** | **新风险 R30 + R31**：R30 = **"照抄注释而非照抄行为"**（`rate_limiter` 头注释把与参考相反的行为写成"与 Go 一致"，使真实分叉隐形 25 轮 → 缓解：注释断言参考行为的每句必须带源码行号，与行为同轮比对）；R31 = **概率性断言被当成确定性门禁**（`entropy_test` 对单字节抽样断言非零，1/256 概率，实测让全绿门禁偶发变红 → 缓解：随机源断言必须报出失败概率并压到 ≲2^-40，核心用例禁单次抽样断言，报告区分确定/概率失败）。两条均由本轮 #158 / #160 实测兑现 | 方法论  |
 
 ---
 
@@ -760,7 +793,7 @@ C++ 侧：`tests/json_reader.{h,cc}`（<120 行扁平解析器，只支持上述
 - [x] `git log` 有首个提交（`1150c03`）
 - [x] §4.7 常量表逐条对源码复核（含 `kOverhead=24` 含 conv、`convSize=4` 补齐、fec 常量行号）
 - [x] **命名合规**：`clang-format --dry-run --Werror` 全绿（6 文件）、`check_guard.py` 通过、无 `#pragma once`
-- [ ] **双平台**：Linux 侧 `build.sh` 冒烟 **未验证**——本机 WSL 被安全策略禁用、无独立 g++；`build.sh` 与 linux preset 已就位，待有 Linux 环境时补跑（记为 E1）
+- [x] **双平台**：Linux 侧 `build.sh` 冒烟 —— **2026-10-19 实机通过**（Ubuntu 22.04.5 / g++ 11.4 / cmake 3.22.1 / ninja 1.10.1，Debug + Release 全绿、零警告）；首次实跑暴露 4 处 Windows-only 漏检，见 §v5.14→v5.15（原记录 E1 阻塞：WSL 被安全策略禁用、无独立 g++）
 
 #### P0 实施记录（v5.5，与计划的偏差）
 
@@ -781,7 +814,7 @@ crc32/sha1/pbkdf2/`FillRand`/snmp/bufferpool（全局单例按 §3.5；pool 按 
 - [x] CRC-32 IEEE 用例 + `frame.json` 的 CRC 字段对拍；FIPS 180-1 SHA-1、RFC 2202 HMAC、RFC 6070 PBKDF2（`primitives_test`）
 - [x] `FillRand` 长度遵守（canary）、非全零、256 次取值互异（`entropy_test`）
 - [x] bufferpool 定长/拒收异容量/取回互异，snmp 计数与表头顺序（`foundation_test`）
-- [ ] Linux `getrandom(2)` 分支未实测（E1 环境阻塞同前）
+- [x] Linux `getrandom(2)` 分支**已实测**（2026-10-19 实机）——该分支此前从未被编译过，Linux 构建的首个错误正落在这里（`out`/`offset` 重复声明），修复后 `entropy_test` 在实机通过；见 §v5.14→v5.15
 
 ### P2 加密层（2.5d）—— ✅ 已完成
 
@@ -898,7 +931,7 @@ socket RAII（**platform/socket 双实现**，决策⑤）→ ringbuffer/`Blocki
 - [x] **错误码行为**：超时/关闭/socket 错误/CRC 失败/output 队列满（静默丢 + KCP 重传兜底）五类与 Go 一致
 - [x] **行为差异（#47/#48）**：`SetReadBuffer` 对 listener session 报 invalid；`SetDscp` 支持矩阵记录（Windows 部分 / Linux 全）
 - [x] **性能基线（§6.3）**：与 `goecho` 的 Go↔Go 基线对比，差距写入 `README.md`（R7）+ `bench.md`；AES-NI 路径与 T 表路径的吞吐差也记录
-- [ ] **双平台**：上述回环与生命周期测试在 Windows + Linux 各跑一遍全绿 —— **Windows 全绿（Release + Debug，16/16）；Linux 待环境（E1）**
+- [x] **双平台**：上述回环与生命周期测试在 Windows + Linux 各跑一遍全绿 —— **Windows 全绿（Release + Debug，16/16）；Linux 全绿**（2026-10-19 实机，Release + Debug 各 16/16、零警告，另加四种 cipher 的 C++↔C++ 回环冒烟）
 
 #### P6 实施记录（v5.10）
 
@@ -1187,6 +1220,9 @@ socket RAII（**platform/socket 双实现**，决策⑤）→ ringbuffer/`Blocki
 | R26 | **"声明了但没人写"的仪器化死代码**（P8.0 引入 `TimedSched::cpu_us_`：头文件注释称"每任务后重发布"，`cpu_us()` 访问器齐全，但全仓无任何写入点，恒返回 0；session 的 update CPU 已由 `update_cpu_us_`（CpuScope 在回调内）覆盖，该成员纯冗余） | 删除成员 + 访问器 + 失效注释与 `profile.h` 包含；由变异测试方法学发现——**对修复做变异验证测试有效性**时逐一核对"文档声明的行为是否有代码兑现"。教训：仪器化代码的文档声明（计数器语义、发布时机）必须与写入点一起 review，否则留下恒零的"测量" |
 | R27 | **测试覆盖的"形状缺口"**（`write_buffers` 超限预检只测了单缓冲区 >INT_MAX；把预检退化成逐块检查的变异可存活——多块各合法、总和超限的批次会被放行后 Crash） | 补两个零分配用例：① 2 × (INT_MAX/2+1) 多缓冲区累加超限（同样期望 `kInvalidArgument`）② 空批次返回 0/kOk（上游亦无早退，钉住当前语义）。变异验证：逐块检查变异 → SEGFAULT 被杀；删除预检 → SEGFAULT 被杀；发送循环双重计数（run 2 实踩 bug）→ session_test 26 + relay_test 8 失败被杀；`recv_n` 改 `store` → profiling 带断言被杀 |
 | R28 | **测试驱动脚本的静默失败面**（三个 Python 驱动各有一处"坏了却报好"：① `profile_split.py` 的 `PROFILE_RE`/`RESULT_RE` 缺 `re.MULTILINE`，`finditer` 对多行日志只在串边界匹配，折叠**静默退化为最后一行**，分解表整个作废而无任何报错；② `--rounds 0` 折叠零样本后仍退出 0，全部门禁 vacuous pass；③ 客户端超时后进程泄漏，占住端口与被计价的 CPU；④ 折叠输入允许没有 RESULT 或携带 ok=0——失败运行的计数器不是有效会话的分解；⑤ `run_matrix.py` 单格挂起抛 `TimeoutExpired` 炸掉整个矩阵，其余 15 格失去参评资格） | ① regex 补 `re.MULTILINE`；② 三脚本统一 `--rounds >= 1`（`profile_split`/`run_bench` 另加 `--mb >= 1`）预检，`parser.error` 退出 2；③ 超时路径先 `kill()` + `wait()` 再退出；④ 折叠路径强制 RESULT 存在且逐条 ok=1；⑤ 单格超时记 `exit=-1` 走格子 FAIL 判定，其余格子照跑。另加 **`tx_n ≥ out_pkts` 对账门**：`SysSendTo` 全仓唯一调用点在 `UdpSession::Tx`，snmp `out_pkts` 计成功、`io_.send_n` 计全部，且 PROFILE 快照在 close() join post 线程之后取——tx_n 更小即计数器 bug，更大即发送实际失败。验证（2026-10-19）：两轮折叠正确展开、ok=0/无 RESULT 均拒收、`--rounds 0`/`--mb 0` 均退出 2；实测路径门禁全过；16 格矩阵 `--rounds 1` 16/16；`run_bench --impl cpp --rounds 2` 冒烟通过 |
+| R29 | **平台分支只被一侧编译器检查过**（Windows-only 开发下，`#else` 分支的语法/语义错误、甚至对不存在符号的调用都不会被 MSVC 触碰） | **已实测兑现**：E1 首次 Linux 构建一次抓到 4 处——`getrandom` 分支重复声明（编译失败）、POSIX 缺 `CpuMicros()` 定义（编译失败）、MSVC 传递包含掩盖的未使用 `std::error_code`、`CMakePresets.json` 缺 release test preset（`build.sh Release` 必挂）。缓解：两侧各跑一次真实构建 + 门禁（`build.bat` / `build.sh`），Linux 实机已接入，见 §v5.14→v5.15。**遗留面**：Linux 侧跨语言互通矩阵与 `recvmmsg`/`sendmmsg` 相关代码仍未在 Linux 上跑过 |
+| R30 | **"照抄注释而非照抄行为"**（代码注释把与参考**相反**的行为写成"与 Go 一致"：`rate_limiter.h` 原文 `clamps the request to the burst` … `so does this port`，而 `x/time/rate.WaitN` 对超 burst 请求是**立即返回不预留 token**） | 第 33 轮（#158）真实踩中：该分叉让超 burst 的 FEC 后处理批次在 1 kB/s 下限速多付 ~96 s 延迟，且**连过 25 轮对抗分析不被发现**。缓解：① 凡注释断言"参考实现如此"的句子**必须带源码行号**，与行为同一轮比照；② 纯行为型契约（限速、调度、错误语义）的每条注释都要回读对应 Go 行；`foundation_test::TestRateLimiter` 用 2 s 上界把"立即放行"与"等满桶"区分开，钉住不回退 |
+| R31 | **概率性断言被当成确定性门禁**（对随机源做单次抽样断言：`entropy_test.cc` 的 `len=1` 用例断言单字节抽样 `!all_zero`，其失败概率 1/256 与实现正确性无关） | 第 35 轮（#160）**实测兑现**：Windows Release 门禁真的失败一次（退出码 8，`FAIL tests/entropy_test.cc:49`），重跑 20 次命中 1 次 —— **全绿构建被误报为坏**，且这类"偶发红"最容易被当成环境噪声而反复重跑，从而掩盖真实回归。缓解：① 凡被测对象含随机源，断言必须给出失败概率并压到 ≲2^-40（本例改 64 次抽样≥1 次非零）；② 门禁核心用例禁止"单次抽样即断言"；③ 报告门禁结果时区分"确定性失败"与"概率性失败" |
 
 ---
 
@@ -1203,4 +1239,4 @@ socket RAII（**platform/socket 双实现**，决策⑤）→ ringbuffer/`Blocki
 - [x] §4 全部表格有自动化测试覆盖（含 CFB 非对齐、RS 变长、§4.7 常量表）
 - [x] 性能基线落 README（§6.3 方法），与 Go 版差距明确并已归因（§6.3.1）
 - [x] 并发/生命周期测试后线程与句柄无泄漏，进程退出不 terminate
-- [ ] **双平台**：Windows + Linux 构建、测试、互通冒烟全部通过（决策⑤）—— Windows 已通过（Release + Debug，16/16），Linux 待环境
+- [x] **双平台**：Windows + Linux 构建、测试、互通冒烟全部通过（决策⑤）—— Windows 已通过（Release + Debug，16/16）；**Linux 已通过**（2026-10-19 实机，Release + Debug 各 16/16 + 零警告 + 四种 cipher 回环冒烟 `ok=1`）。**遗留**：Linux 侧跨语言 16 格矩阵未重跑（需 Go 1.24 工具链与 `kcp-go` 检出，见 R29）
