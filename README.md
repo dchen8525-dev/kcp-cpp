@@ -19,9 +19,9 @@ kcp-go source line number; when code and plan disagree, the plan's line referenc
 | P3 | Reed-Solomon GF(2^8) | **done** |
 | P4 | FEC encoder/decoder | **done** |
 | P5 | KCP ARQ state machine | **done** |
-| P6 | UDP session + listener | **done** (Linux run pending, see E1) |
+| P6 | UDP session + listener | **done** (Linux real-machine run passed, E1 closed 2026-10-19) |
 | P7 | cross-language interop verification (Go <-> C++) | **done** (`matrix.md`, 16/16 x 3 rounds) |
-| P8 | performance convergence | **defined, not started** (`PORTING-PLAN.md` §P8; first item is instrumentation) |
+| P8 | performance convergence | **done** (P8.0 instrumentation + attribution; P8.1–P8.6 triggers not met, `PORTING-PLAN.md` §6.3.2) |
 
 ## Build
 
@@ -186,7 +186,7 @@ matches kcp-go's `Dial`.
 
 Google C++ Style with one recorded deviation (D8: 100-column limit). Files are `.h` / `.cc`,
 headers use `#define KCP_*_H_` guards (`#pragma once` is forbidden), and every ported file keeps the
-upstream MIT header. Deviations from kcp-go behavior are listed in PORTING-PLAN.md §3.4.1 (D1–D19)
+upstream MIT header. Deviations from kcp-go behavior are listed in PORTING-PLAN.md §3.4.1 (D1–D21)
 and must be extended before adding a new one.
 
 `tools/interop` holds the Go echo server/client used for cross-language acceptance (P7) and for the
