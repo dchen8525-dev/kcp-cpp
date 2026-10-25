@@ -6,15 +6,18 @@
 // every session, so the invariants checked here (exact buffer size, rejected size mismatch, counter
 // ordering matching the header names) are what keeps later stages from corrupting shared state.
 
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "kcp/internal/bufferpool.h"
 #include "kcp/internal/constants.h"
 #include "kcp/internal/rate_limiter.h"
+#include "kcp/platform/socket.h"
 #include "kcp/snmp.h"
 
 namespace {
@@ -149,12 +152,54 @@ void TestRateLimiter() {
   CHECK(elapsed < 2000);
 }
 
+// Close() must wake a thread parked inside Acquire and make every later call return immediately.
+// A session close joins its post thread, and the listener's single monitor thread joins session
+// closes on the stale-conv reset path - a parked limiter would otherwise freeze every session on
+// the listener for up to burst/rate seconds.
+void TestRateLimiterCloseUnblocksAcquire() {
+  using kcp::internal::RateLimiter;
+
+  RateLimiter limiter(1000);
+  const std::size_t burst = kcp::kMaxBatchSize * kcp::kMtuLimit;
+  limiter.Acquire(burst);  // bucket starts full: this drains it without waiting
+
+  std::thread waiter([&] { limiter.Acquire(2000); });  // 2 s of tokens: parks without a Close
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  const auto start = std::chrono::steady_clock::now();
+  limiter.Close();
+  waiter.join();
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - start)
+                           .count();
+  // Budget: notify latency plus scheduling, far under the 2 s the waiter would otherwise sleep.
+  CHECK(elapsed < 1000);
+
+  // A closed limiter transmits without waiting at all.
+  const auto again = std::chrono::steady_clock::now();
+  limiter.Acquire(burst);
+  CHECK(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+                                                              again)
+            .count() < 100);
+}
+
+#ifndef _WIN32
+// A signal landing inside a blocking recvfrom yields EINTR. The read loops treat the ignorable
+// set as "keep going", so EINTR must be in it - treating it as fatal kills a client read loop,
+// or a listener's monitor (starving every session it serves), on any stray SIGALRM/SIGCHLD. Go
+// retries EINTR inside net.UDPConn.ReadFrom. POSIX-only: Winsock has no EINTR.
+void TestEintrIsIgnorable() { CHECK(kcp::platform::IsIgnorableRecvError(EINTR)); }
+#endif
+
 }  // namespace
 
 int main() {
   TestBufferPool();
   TestSnmp();
   TestRateLimiter();
+  TestRateLimiterCloseUnblocksAcquire();
+#ifndef _WIN32
+  TestEintrIsIgnorable();
+#endif
 
   if (g_failures != 0) {
     std::fprintf(stderr, "foundation_test: %d failure(s)\n", g_failures);

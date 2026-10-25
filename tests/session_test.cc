@@ -738,6 +738,170 @@ void TestListenerSurvivesPeerDisappearing() {
   listener->close(nullptr);
 }
 
+// ---------------------------------------------------------------------------------------------
+
+// A raw on-wire KCP data segment for a chosen conv, naked (no crypt, no FEC) - exactly the form
+// the listener's default PacketInput branch parses. Used to drive the conv-reset path: a packet
+// with a different conv and sn == 0 from a live address must replace the session.
+std::vector<std::uint8_t> RawKcpPush(std::uint32_t conv, std::uint32_t sn, std::uint32_t una,
+                                     const std::string& payload) {
+  std::vector<std::uint8_t> pkt(24 + payload.size(), 0);
+  const auto put32 = [&pkt](std::size_t off, std::uint32_t v) {
+    pkt[off] = static_cast<std::uint8_t>(v);
+    pkt[off + 1] = static_cast<std::uint8_t>(v >> 8);
+    pkt[off + 2] = static_cast<std::uint8_t>(v >> 16);
+    pkt[off + 3] = static_cast<std::uint8_t>(v >> 24);
+  };
+  put32(0, conv);  // conv
+  pkt[4] = 81;     // cmd = push
+  pkt[5] = 0;      // frg = last fragment
+  pkt[6] = 32;     // wnd
+  put32(8, 1);     // ts
+  put32(12, sn);   // sn
+  put32(16, una);  // una
+  put32(20, static_cast<std::uint32_t>(payload.size()));
+  std::memcpy(pkt.data() + 24, payload.data(), payload.size());
+  return pkt;
+}
+
+// The conv-reset contract (listener.cc "A different conv on a live address is only accepted as a
+// reset"): each replacement must leave exactly one live session for the address, the replaced one
+// closed, and the replacement must actually receive data sent to its conv. CloseSession only
+// erases the entry it still owns - an unconditional erase would orphan a replacement that was
+// registered while the old session's close was still draining, and every later packet from that
+// address would then miss the map.
+void TestConvResetKeepsReplacementSession() {
+  Pair pair;
+  if (!Establish(&pair, kcp::Crypt{}, 0, 0, "conv-reset")) {
+    return;
+  }
+
+  kcp::platform::SocketAddress listener_addr;
+  if (!kcp::platform::SocketAddress::ParseHostPort(pair.listener->addr(), &listener_addr)) {
+    Fail(__FILE__, __LINE__, "could not parse listener address");
+    return;
+  }
+
+  // Borrows the client's socket so the reset arrives from the live address the map keys on.
+  const auto send_via_client = [&](const std::vector<std::uint8_t>& pkt) {
+    std::error_code ec;
+    pair.client->Control(
+        [&](kcp::platform::SocketHandle fd) {
+          return kcp::platform::SysSendTo(fd, pkt.data(), pkt.size(), listener_addr) >= 0 ? 0 : -1;
+        },
+        &ec);
+    return !ec;
+  };
+
+  // Reset 1: conv A -> conv B. The monitor must close S_A, register S_B under the same key, and
+  // hand S_B to Accept(); the crafted push is S_B's first data, so reading it back proves the
+  // replacement owns the address.
+  const std::uint32_t conv_b = pair.client->conv() + 1;
+  if (!send_via_client(RawKcpPush(conv_b, 0, 0, "hello"))) {
+    Fail(__FILE__, __LINE__, "reset packet 1 did not send");
+    return;
+  }
+
+  pair.listener->SetReadDeadline(AfterMs(5000));
+  std::error_code ec;
+  auto s_b = pair.listener->Accept(&ec);
+  if (!s_b) {
+    Fail(__FILE__, __LINE__, "replacement session was not accepted: " + ec.message());
+    return;
+  }
+  if (s_b->conv() != conv_b) {
+    Fail(__FILE__, __LINE__, "accepted session has conv " + std::to_string(s_b->conv()));
+    return;
+  }
+  if (pair.listener->session_count() != 1) {
+    Fail(__FILE__, __LINE__,
+         "expected exactly one live session after reset 1, have " +
+             std::to_string(pair.listener->session_count()));
+    return;
+  }
+
+  char buf[64] = {0};
+  s_b->SetReadDeadline(AfterMs(5000));
+  const int got = s_b->read(buf, sizeof(buf), &ec);
+  if (got != 5 || std::memcmp(buf, "hello", 5) != 0) {
+    Fail(__FILE__, __LINE__, "replacement session did not receive its conv's data");
+    return;
+  }
+
+  // Reset 2 through the same address: S_B must be closed and erased (identity matches), S_C
+  // registered in its place. This drives both branches of the identity check in one flow.
+  const std::uint32_t conv_c = conv_b + 1;
+  if (!send_via_client(RawKcpPush(conv_c, 0, 0, "world"))) {
+    Fail(__FILE__, __LINE__, "reset packet 2 did not send");
+    return;
+  }
+
+  pair.listener->SetReadDeadline(AfterMs(5000));
+  auto s_c = pair.listener->Accept(&ec);
+  if (!s_c || s_c->conv() != conv_c) {
+    Fail(__FILE__, __LINE__, "second replacement was not accepted");
+    return;
+  }
+  if (pair.listener->session_count() != 1) {
+    Fail(__FILE__, __LINE__,
+         "expected exactly one live session after reset 2, have " +
+             std::to_string(pair.listener->session_count()));
+    return;
+  }
+  if (!s_b->is_closed()) {
+    Fail(__FILE__, __LINE__, "replaced session was not closed by the reset");
+  }
+
+  // A late, redundant close of the already-replaced S_B must not disturb the live entry.
+  s_b->close(nullptr);
+  if (pair.listener->session_count() != 1 || s_c->is_closed()) {
+    Fail(__FILE__, __LINE__, "stale close disturbed the live replacement session");
+    return;
+  }
+  s_c->close(nullptr);
+  pair.client->close(nullptr);
+  pair.listener->close(nullptr);
+}
+
+// Control()/SetDscp()/Set{Read,Write}Buffer() must not hand out or operate on a descriptor that
+// close() already closed: the OS may have reused the handle value for an unrelated socket. Go
+// surfaces the equivalent as "use of closed network connection" from the conn method.
+void TestControlAfterCloseIsRejected() {
+  Pair pair;
+  if (!Establish(&pair, kcp::Crypt{}, 0, 0, "control-after-close")) {
+    return;
+  }
+
+  bool invoked = false;
+  std::error_code ec;
+  pair.client->close(nullptr);
+  const int rc = pair.client->Control(
+      [&](kcp::platform::SocketHandle) {
+        invoked = true;
+        return 0;
+      },
+      &ec);
+  if (rc == 0 || ec != kcp::MakeErrorCode(ErrorCode::kClosedPipe) || invoked) {
+    Fail(__FILE__, __LINE__, "session Control after close must fail without invoking the callback");
+  }
+
+  bool listener_invoked = false;
+  pair.listener->close(nullptr);
+  const int lrc = pair.listener->Control(
+      [&](kcp::platform::SocketHandle) {
+        listener_invoked = true;
+        return 0;
+      },
+      &ec);
+  if (lrc == 0 || ec != kcp::MakeErrorCode(ErrorCode::kClosedPipe) || listener_invoked) {
+    Fail(__FILE__, __LINE__,
+         "listener Control after close must fail without invoking the callback");
+  }
+  if (pair.listener->SetReadBuffer(65536) != ErrorCode::kClosedPipe) {
+    Fail(__FILE__, __LINE__, "listener SetReadBuffer after close must fail");
+  }
+}
+
 // P8.0 regression guard: the accounting instrumentation (SessionProfile / IoCounters / CpuScope)
 // must not disturb the pipeline it measures. A transfer with profiling on has to land byte-exact,
 // and the counters it leaves behind have to be self-consistent: ACK traffic must come back for the
@@ -865,6 +1029,8 @@ int main() {
   TestListenerDeadlineAndClose();
   TestListenerCloseClosesSessions();
   TestListenerSurvivesPeerDisappearing();
+  TestConvResetKeepsReplacementSession();
+  TestControlAfterCloseIsRejected();
   TestOobRequiresFec();
   TestOobRoundTrip();
   TestSocketOptionMatrix();

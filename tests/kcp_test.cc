@@ -407,6 +407,38 @@ void TestCwndBootstrap() {
   CHECK_EQ(k.wait_snd(), 3);
 }
 
+void TestFlushReturnsNextUpdate() {
+  // sess.go:807 re-arms the session timer with flush(FULL)'s return value: the milliseconds
+  // until the earliest resendts, capped at interval. Update()+Check() cannot express this -
+  // Update only flushes on a ts_flush tick, so a resendts that falls between ticks is deferred
+  // to the next tick (up to interval of extra tail-loss latency). The return value must
+  // therefore carry the true resendts diff whenever it is closer than the interval.
+  std::uint32_t now = 30;
+  std::vector<Bytes> emitted;
+  kcp::Kcp k(
+      11,
+      [&emitted](const std::uint8_t* buf, std::size_t len) {
+        emitted.emplace_back(buf, buf + len);
+      },
+      [&now]() { return now; });
+
+  const Bytes payload = Pattern(3000, 0x77);
+  CHECK_EQ(k.Send(payload.data(), payload.size()), 0);
+
+  k.Update();  // bootstrap: ts_flush = 30, cwnd still 0, nothing sent
+  now = 130;
+  k.Update();  // tick: one segment in flight, resendts = 130 + 200 (initial rto) = 330
+  CHECK_EQ(emitted.size(), 1u);
+
+  now = 280;  // mid-tick: 330 - 280 = 50 < interval (100)
+  CHECK_EQ(k.Flush(kcp::kFlushFull), 50u);
+
+  now = 330;  // resendts due: the RTO retransmit must fire on this flush call
+  const std::uint64_t lost0 = kcp::DefaultSnmp().lost_segs.load();
+  CHECK_EQ(k.Flush(kcp::kFlushFull), 100u);  // rto doubled to 400 -> capped at interval
+  CHECK_EQ(kcp::DefaultSnmp().lost_segs.load(), lost0 + 1);
+}
+
 void TestSetMtuBoundary() {
   kcp::Kcp k(0, [](const std::uint8_t*, std::size_t) {});
   CHECK_EQ(k.SetMtu(-1), -1);
@@ -673,6 +705,7 @@ int main() {
   TestDuplicateIsCountedNotQueued();
   TestSetMtuBoundary();
   TestCwndBootstrap();
+  TestFlushReturnsNextUpdate();
 
   std::printf("lossy link (virtual clock, 1 MiB, rtt 200ms):\n");
   TestLossyLink(0.0, LossModel::kUniform, 10, 2, 1);

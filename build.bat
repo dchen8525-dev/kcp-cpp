@@ -57,6 +57,12 @@ set "LIB=%SDKLIB%\ucrt\x64;%SDKLIB%\um\x64;%LIB%"
 set "PATH=%SDKROOT%\bin\%SDKVER%\x64;%PATH%"
 
 :sdk_ready
+rem --- python for the gate scripts: plain `python` first, the Windows `py` launcher as fallback ---
+rem A box with only the launcher installed otherwise fails the gate with a misleading
+rem "'python' is not recognized" after a fully green compile.
+set "PY=python"
+where python >nul 2>&1 || set "PY=py"
+
 echo [kcp-cpp] configure
 cmake --preset windows-x64 || goto :error
 
@@ -64,10 +70,10 @@ echo [kcp-cpp] build (%CONFIG%)
 cmake --build --preset windows-x64-%CFG_PRESET% || goto :error
 
 echo [kcp-cpp] header guard check
-python tools\check_guard.py || goto :error
+%PY% tools\check_guard.py || goto :error
 
 echo [kcp-cpp] clang-format check
-python tools\check_format.py || goto :error
+%PY% tools\check_format.py || goto :error
 
 echo [kcp-cpp] ctest (%CONFIG%)
 ctest --preset windows-x64-%CFG_PRESET% || goto :error
