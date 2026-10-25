@@ -1,0 +1,10 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+# Threads::Threads rides in the exported INTERFACE_LINK_LIBRARIES on POSIX
+# (it is PRIVATE on Windows, where find_dependency is a harmless no-op).
+find_dependency(Threads)
+
+include("${CMAKE_CURRENT_LIST_DIR}/kcpTargets.cmake")
+
+check_required_components(kcp)

@@ -11,6 +11,14 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
+# Tooling (echo examples + throughput benchmarks) only makes sense in a standalone
+# checkout; package builds (e.g. the vcpkg overlay port in kcp-proxy-cpp) and
+# embedders turn it off.
+option(KCP_BUILD_TOOLS "Build the examples/ echo tools and bench/ benchmarks" ON)
+
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
 # Sources are listed explicitly (no GLOB): a missing file must fail the build, not be silently
 # skipped. Each stage of PORTING-PLAN.md appends to this list.
 set(KCP_SOURCES
@@ -44,6 +52,7 @@ add_library(kcp::kcp ALIAS kcp)
 
 target_include_directories(kcp
   PUBLIC  "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+          "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>"
 )
 
 if(WIN32)
@@ -69,6 +78,35 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   endif()
   # Echo tools (examples/) and the measuring sticks (bench/): the C++ half of the throughput
   # baseline in PORTING-PLAN.md §6.3 and the C++ side of the P7 cross-language matrix.
-  add_subdirectory(examples)
-  add_subdirectory(bench)
+  if(KCP_BUILD_TOOLS)
+    add_subdirectory(examples)
+    add_subdirectory(bench)
+  endif()
 endif()
+
+# ── Install / package export ──
+# Makes the library consumable via `find_package(kcp CONFIG REQUIRED)` — required
+# by the vcpkg overlay port in kcp-proxy-cpp and any other embedder. The target
+# keeps the name `kcp::kcp` so downstream link code needs no changes.
+install(TARGETS kcp EXPORT kcpTargets
+  ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(EXPORT kcpTargets
+  FILE kcpTargets.cmake
+  NAMESPACE kcp::
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/kcp)
+
+configure_package_config_file(
+  "${CMAKE_CURRENT_SOURCE_DIR}/cmake/kcpConfig.cmake.in"
+  "${CMAKE_CURRENT_BINARY_DIR}/kcpConfig.cmake"
+  INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/kcp)
+write_basic_package_version_file(
+  "${CMAKE_CURRENT_BINARY_DIR}/kcpConfigVersion.cmake"
+  VERSION ${PROJECT_VERSION}
+  COMPATIBILITY SameMajorVersion)
+install(FILES
+  "${CMAKE_CURRENT_BINARY_DIR}/kcpConfig.cmake"
+  "${CMAKE_CURRENT_BINARY_DIR}/kcpConfigVersion.cmake"
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/kcp)

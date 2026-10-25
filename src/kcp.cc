@@ -144,8 +144,8 @@ Kcp::Kcp(std::uint32_t conv, OutputCallback output, Clock clock)
   dead_link_ = kDeadLink;
 }
 
-// kcp.go:298-321
-int Kcp::PeekSize() {
+// kcp.go:298-321 — const (only reads rcv_queue_; see kcp.h).
+int Kcp::PeekSize() const {
   const Segment* head = rcv_queue_.Peek();
   if (head == nullptr) {
     return -1;

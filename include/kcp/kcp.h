@@ -73,7 +73,9 @@ class Kcp {
   Kcp& operator=(Kcp&&) = delete;
 
   // Size of the next complete message, -1 when nothing is readable (kcp.go:298-321).
-  int PeekSize();
+  // Const: it only reads rcv_queue_, and embedders expose peek_size() through a
+  // const accessor (the kcp-proxy vendored-copy patch, promoted upstream).
+  int PeekSize() const;
 
   // Copies the next message into 'buffer'. Returns the byte count, -1 when no message is ready,
   // -2 when the message does not fit (kcp.go:329-379).
@@ -130,6 +132,14 @@ class Kcp {
   // Send/remote window bounds, read by the session's write path to decide whether to block.
   std::uint32_t snd_wnd() const { return snd_wnd_; }
   std::uint32_t rcv_wnd() const { return rcv_wnd_; }
+
+  // Read-only accessors over the tuning state applied by NoDelay(), so embedders can verify that
+  // configured constants reached the live protocol state (the kcp-proxy vendored-copy patch,
+  // promoted upstream; mirrors the conv()/mtu()/snd_wnd()/rcv_wnd() set).
+  std::uint32_t nodelay() const { return nodelay_; }
+  std::uint32_t interval() const { return interval_; }
+  std::int32_t fastresend() const { return fastresend_; }
+  std::int32_t nocwnd() const { return nocwnd_; }
 
   // Smoothed RTT and its variance in milliseconds, and the current retransmission timeout.
   std::int32_t srtt() const { return rx_srtt_; }
