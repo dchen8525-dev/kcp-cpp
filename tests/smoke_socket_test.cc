@@ -87,6 +87,35 @@ int main() {
   CHECK(SocketAddress::Parse("127.0.0.1", 1, &other));
   CHECK(other != client_addr);
 
+  // --- IPv4-mapped IPv6 identity (R47) -------------------------------------------------------
+  // A peer named as ::ffff:127.0.0.1 is the same peer as 127.0.0.1: Go compares net.UDPAddr with
+  // IP.Equal (readloop.go:29-35). The family a socket reports must not decide it, or a session
+  // dialled with a mapped literal drops every datagram (udp_session.cc ReadLoop).
+  SocketAddress mapped;
+  CHECK(SocketAddress::Parse("::ffff:127.0.0.1", 9000, &mapped));
+  SocketAddress plain;
+  CHECK(SocketAddress::Parse("127.0.0.1", 9000, &plain));
+  CHECK(mapped == plain);
+  CHECK(plain == mapped);
+  CHECK(mapped.ToString() == plain.ToString());
+  CHECK(mapped.ToString() == "127.0.0.1:9000");
+  // ... but the port still separates them.
+  SocketAddress mapped_other_port;
+  CHECK(SocketAddress::Parse("::ffff:127.0.0.1", 9001, &mapped_other_port));
+  CHECK(mapped_other_port != plain);
+  // ... and a different host does not become equal by normalisation.
+  SocketAddress mapped_other_host;
+  CHECK(SocketAddress::Parse("::ffff:127.0.0.2", 9000, &mapped_other_host));
+  CHECK(mapped_other_host != plain);
+  // A real IPv6 address is unchanged by the mapped-range handling.
+  SocketAddress v6_a;
+  CHECK(SocketAddress::Parse("::1", 9000, &v6_a));
+  SocketAddress v6_b;
+  CHECK(SocketAddress::Parse("::1", 9000, &v6_b));
+  CHECK(v6_a == v6_b);
+  CHECK(v6_a != plain);
+  CHECK(v6_a.ToString() == "[::1]:9000");
+
   CHECK(kcp::platform::SysClose(client) == 0);
   CHECK(kcp::platform::SysClose(server) == 0);
   kcp::platform::ShutdownSockets();

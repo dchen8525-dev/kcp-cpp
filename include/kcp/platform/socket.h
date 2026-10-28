@@ -33,17 +33,17 @@ class SocketAddress {
  public:
   SocketAddress();
 
-  // Parses a numeric address ("127.0.0.1", "::1") plus port. No DNS resolution: the session layer
-  // never needs it for the loopback test matrix, and getaddrinfo() would drag in another
-  // platform-specific failure mode.
+  // Parses a numeric address ("127.0.0.1", "::1", "::ffff:127.0.0.1") plus port. No DNS
+  // resolution - see ParseHostPort. Returns false for anything else, including a host name.
   static bool Parse(const std::string& ip, std::uint16_t port, SocketAddress* out);
 
-  // Parses "1.2.3.4:9000", "[::1]:9000" or ":9000" (wildcard bind). No DNS resolution, same
-  // reason as Parse().
+  // Parses "1.2.3.4:9000", "[::1]:9000" or ":9000" (wildcard bind). No DNS resolution; a host
+  // name is rejected rather than silently resolved to 0.0.0.0.
   static bool ParseHostPort(const std::string& host_port, SocketAddress* out);
 
-  // Returns "ip:port"; used for Listener session keys (PORTING-PLAN.md §3.1: the key is the
-  // source address string, not conv).
+  // Returns "ip:port" or "[ipv6]:port". Used for Listener session keys (PORTING-PLAN.md §3.1: the
+  // key is the source address string, not conv). IPv4-mapped IPv6 peers are printed in their IPv4
+  // form, so both stacks key the same peer to the same string.
   std::string ToString() const;
 
   bool valid() const { return len_ != 0; }
@@ -55,6 +55,13 @@ class SocketAddress {
   int mutable_size() const;
   void set_size(int len) { len_ = len; }
 
+  // Address equality, family aware but not family strict: an IPv4-mapped IPv6 address
+  // (::ffff:a.b.c.d) equals the IPv4 address a.b.c.d. The reference compares net.UDPAddr with
+  // IP.Equal, which has the same property (readloop.go:29-35, sameUDPAddr).
+  //
+  // Getting this wrong is total one-way data loss, not a cosmetic difference: the session drops
+  // every datagram whose source fails this test (udp_session.cc ReadLoop), so a peer named with a
+  // mapped literal would never deliver a single packet.
   bool operator==(const SocketAddress& other) const;
   bool operator!=(const SocketAddress& other) const { return !(*this == other); }
 
@@ -80,7 +87,7 @@ std::string ErrorMessage(int err);
 // reported to the *next* recvfrom as WSAECONNRESET (10054). A UDP peer that closes while the other
 // side is echoing is the normal end of a transfer, so treating 10054 as fatal stops the listener's
 // monitor thread and starves every session it owns - kcp-go never returns from its read loops for
-// exactly this reason (readloop.go:47-70, listener.go:1229).
+// exactly this reason (readloop.go:47-70, sess.go:1229).
 bool IsIgnorableRecvError(int err);
 
 // Thin syscall wrappers. Named with a sys_ prefix so no member function of the session classes

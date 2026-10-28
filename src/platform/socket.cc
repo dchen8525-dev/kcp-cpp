@@ -52,6 +52,18 @@ const sockaddr* AsSockAddr(const unsigned char* storage) {
   return reinterpret_cast<const sockaddr*>(storage);
 }
 
+// True for ::ffff:0:0/96, the IPv4-mapped range. Addresses in it denote an IPv4 host, and both
+// stacks hand them out (a dual-stack listener reports an IPv4 peer this way).
+bool IsV4Mapped(const in6_addr& addr) {
+  const std::uint8_t* b = addr.s6_addr;
+  for (int i = 0; i < 10; ++i) {
+    if (b[i] != 0) {
+      return false;
+    }
+  }
+  return b[10] == 0xff && b[11] == 0xff;
+}
+
 }  // namespace
 
 SocketAddress::SocketAddress() {
@@ -141,8 +153,16 @@ std::string SocketAddress::ToString() const {
     port = ntohs(addr4->sin_port);
   } else if (sa->sa_family == AF_INET6) {
     const auto* addr6 = reinterpret_cast<const sockaddr_in6*>(sa);
-    inet_ntop(AF_INET6, &addr6->sin6_addr, host, sizeof(host));
     port = ntohs(addr6->sin6_port);
+    // An IPv4-mapped peer is the same peer as its IPv4 address, and it must key to the same string:
+    // the listener keys its session map by this text (listener.cc PacketInput), so a dual-stack
+    // socket reporting ::ffff:a.b.c.d while another path reports a.b.c.d would split one peer into
+    // two sessions - each holding half the conversation.
+    if (IsV4Mapped(addr6->sin6_addr)) {
+      inet_ntop(AF_INET, &addr6->sin6_addr.s6_addr[12], host, sizeof(host));
+      return std::string(host) + ":" + std::to_string(port);
+    }
+    inet_ntop(AF_INET6, &addr6->sin6_addr, host, sizeof(host));
     return std::string("[") + host + "]:" + std::to_string(port);
   } else {
     return std::string();
@@ -161,27 +181,50 @@ int SocketAddress::mutable_size() const {
 }
 
 bool SocketAddress::operator==(const SocketAddress& other) const {
-  if (len_ != other.len_) {
+  if (len_ == 0 || other.len_ == 0) {
+    return len_ == other.len_;
+  }
+  const sockaddr* a = AsSockAddr(storage_);
+  const sockaddr* b = AsSockAddr(other.storage_);
+
+  // Reduce every shape to (address bytes, port, zone), so the family a socket happened to report
+  // cannot decide the answer - Go's IP.Equal has the same property (readloop.go:29-35).
+  std::uint8_t a_addr[16] = {0};
+  std::uint8_t b_addr[16] = {0};
+  std::uint16_t a_port = 0;
+  std::uint16_t b_port = 0;
+  std::uint32_t a_zone = 0;
+  std::uint32_t b_zone = 0;
+
+  auto load = [](const sockaddr* sa, std::uint8_t addr[16], std::uint16_t* port,
+                 std::uint32_t* zone) {
+    if (sa->sa_family == AF_INET) {
+      const auto* in4 = reinterpret_cast<const sockaddr_in*>(sa);
+      std::memcpy(addr + 12, &in4->sin_addr, 4);
+      *port = in4->sin_port;
+      *zone = 0;
+      return true;
+    }
+    if (sa->sa_family == AF_INET6) {
+      const auto* in6 = reinterpret_cast<const sockaddr_in6*>(sa);
+      if (IsV4Mapped(in6->sin6_addr)) {
+        std::memcpy(addr + 12, &in6->sin6_addr.s6_addr[12], 4);
+        *port = in6->sin6_port;
+        *zone = 0;
+        return true;
+      }
+      std::memcpy(addr, &in6->sin6_addr, 16);
+      *port = in6->sin6_port;
+      *zone = in6->sin6_scope_id;
+      return true;
+    }
+    return false;
+  };
+
+  if (!load(a, a_addr, &a_port, &a_zone) || !load(b, b_addr, &b_port, &b_zone)) {
     return false;
   }
-  if (len_ == 0) {
-    return true;
-  }
-  if (AsSockAddr(storage_)->sa_family != AsSockAddr(other.storage_)->sa_family) {
-    return false;
-  }
-  if (len_ == static_cast<int>(sizeof(sockaddr_in))) {
-    const auto* a = reinterpret_cast<const sockaddr_in*>(storage_);
-    const auto* b = reinterpret_cast<const sockaddr_in*>(other.storage_);
-    return a->sin_port == b->sin_port && a->sin_addr.s_addr == b->sin_addr.s_addr;
-  }
-  if (len_ == static_cast<int>(sizeof(sockaddr_in6))) {
-    const auto* a = reinterpret_cast<const sockaddr_in6*>(storage_);
-    const auto* b = reinterpret_cast<const sockaddr_in6*>(other.storage_);
-    return a->sin6_port == b->sin6_port &&
-           std::memcmp(&a->sin6_addr, &b->sin6_addr, sizeof(in6_addr)) == 0;
-  }
-  return std::memcmp(storage_, other.storage_, static_cast<std::size_t>(len_)) == 0;
+  return a_port == b_port && a_zone == b_zone && std::memcmp(a_addr, b_addr, 16) == 0;
 }
 
 // Non-inline copy/move are implicit; storage_ is a plain array so the default ones are correct.

@@ -224,6 +224,17 @@ void Listener::PacketInput(std::uint8_t* data, std::size_t len,
     if (sn != 0) {
       return;
     }
+    // Drop the stale entry *before* the reset, in one critical section: a reset ran outside the
+    // lock would leave the old session's close() to erase the map entry afterwards (D7 stretches
+    // that window across an entire join), and any packet from this address in between would be
+    // dispatched into the dying session and lost.
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      const auto it = sessions_.find(key);
+      if (it != sessions_.end() && it->second.get() == session.get()) {
+        sessions_.erase(it);
+      }
+    }
     session->close(nullptr);
   }
 
@@ -231,22 +242,35 @@ void Listener::PacketInput(std::uint8_t* data, std::size_t len,
     return;
   }
 
-  {
-    std::lock_guard<std::mutex> lock(mu_);
-    if (accepts_.size() >= kAcceptBacklog) {
-      return;
-    }
-  }
-
   std::shared_ptr<UdpSession> created =
       UdpSession::Create(conv, crypt_, data_shards_, parity_shards_, this, fd_, false, from);
-  created->KcpInput(data, len);
 
+  // Backlog admission and map insertion happen under one lock, and the datagram is decoded *after*
+  // the session is reachable. Both orderings matter:
+  //  * admission checked outside the section would let two creators overrun the backlog, and a
+  //    rejected packet would still have created (and leaked) a session;
+  //  * KcpInput outside the section means a second datagram from the same address arriving in
+  //    between finds no map entry and creates a *second* session for one peer - the first one
+  //    then stays in the accept queue forever with a partial handshake (kcpInErrors on every
+  //    later datagram it never sees).
+  // The reference has the same shape (sess.go:1262-1272); the difference is that its ownership
+  // rules are implicit in Go's GC, while here an unreachable session is a leaked thread pair.
+  bool admitted = false;
   {
     std::lock_guard<std::mutex> lock(mu_);
-    sessions_[key] = created;
-    accepts_.push_back(created);
+    if (!closed_.load(std::memory_order_acquire) && accepts_.size() < kAcceptBacklog) {
+      sessions_[key] = created;
+      accepts_.push_back(created);
+      admitted = true;
+    }
   }
+  if (!admitted) {
+    // Withdrawn before it ever ran: a closed listener must not start new threads, and an
+    // over-limit one must not accept past its backlog.
+    created->close(nullptr);
+    return;
+  }
+  created->KcpInput(data, len);
   accept_cv_.notify_one();
 }
 
@@ -278,7 +302,8 @@ std::shared_ptr<UdpSession> Listener::Accept(std::error_code* ec) {
 }
 
 void Listener::close(std::error_code* ec) {
-  std::vector<std::shared_ptr<UdpSession>> owned;
+  // Every shared_ptr handed out by Accept() outlives this call and calls back into
+  // CloseSession() from its own thread, so closing must not be what destroys the map.
   {
     std::lock_guard<std::mutex> lock(mu_);
     if (closed_.load(std::memory_order_acquire)) {
@@ -296,19 +321,27 @@ void Listener::close(std::error_code* ec) {
   }
 
   // Listener.Close closes every child (listener.go:1158-1176) before the shared socket goes away.
-  // Dropping the references without closing them would be wrong twice over: the sessions would keep
-  // using an fd that is about to be closed, and their destructors would call back into
-  // CloseSession() on a Listener that no longer has a sessions_ map to erase from.
+  // The children are closed with mu_ released: UdpSession::close() calls back into CloseSession()
+  // (needs mu_) and joins its own worker threads, which may be parked on the token bucket; holding
+  // the listener lock across that is a lock-order inversion (L3 -> L2) waiting for a slow path.
+  std::vector<std::shared_ptr<UdpSession>> owned;
   {
     std::lock_guard<std::mutex> lock(mu_);
+    owned.reserve(sessions_.size());
     for (auto& entry : sessions_) {
       owned.push_back(entry.second);
     }
-    sessions_.clear();
-    accepts_.clear();
   }
   for (auto& session : owned) {
     session->close(nullptr);
+  }
+  // Only now that every child has stopped can the map and the accept queue be dropped: a session
+  // still queued here may be held by a blocked Accept() caller, and the queue itself is what the
+  // destructor reports on.
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    sessions_.clear();
+    accepts_.clear();
   }
 
   // mu_ pairs with Control()/SetDscp()/Set{Read,Write}Buffer(), which read fd_ under the same
@@ -321,6 +354,7 @@ void Listener::close(std::error_code* ec) {
       fd_ = platform::kInvalidSocket;
     }
   }
+  // With the children gone, no session can re-insert into the map through a late datagram.
   Succeed(ec);
 }
 
