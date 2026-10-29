@@ -18,14 +18,17 @@
 namespace kcp {
 namespace internal {
 
-// Token bucket standing in for golang.org/x/time/rate (sess.go:648-658). kcp-go builds a limiter
-// with `rate.NewLimiter(rate.Limit(bytesPerSecond), maxBatchSize*mtuLimit)` and calls WaitN before
-// each transmit; a non-positive rate is rate.Inf, i.e. unlimited.
+// Token bucket standing in for golang.org/x/time/rate. The reference builds a limiter with
+// `rate.NewLimiter(rate.Limit(bytesPerSecond), maxBatchSize*mtuLimit)` and gates every transmit
+// batch through it in flushTx (postprocess.go:59-77); a non-positive rate is rate.Inf, i.e.
+// unlimited.
 //
-// WaitN's error is discarded in the reference ("only returns error if the limiter is
-// misconfigured"), and a request larger than the burst is exactly such a case: WaitN returns
-// without reserving a token, so the oversized batch is transmitted immediately. This implementation
-// mirrors that early-out rather than blocking for a full burst.
+// The reference calls ReserveN and discards a failed reservation ("A batch above the burst can
+// never be allowed"): a batch larger than the burst is transmitted immediately, without reserving
+// a token or waiting. A reserved batch whose delay is nonzero is held and sent when the
+// reservation comes due - this port realizes the same send time by blocking its own post thread
+// in Acquire (the per-session post thread is deviation D7), and mirrors the oversized-batch
+// early-out rather than blocking for a full burst.
 class RateLimiter {
  public:
   // bytes_per_second == 0 means unlimited.

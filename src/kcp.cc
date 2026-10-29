@@ -590,8 +590,10 @@ std::uint32_t Kcp::Flush(FlushType flush_type) {
     }
   };
 
-  // A segment queued before a shrinking SetMtu can be larger than the buffer the new MTU
-  // implies. Go would slice out of range here; grow instead so the segment still goes out intact.
+  // A segment queued before a shrinking SetMtu can be larger than the buffer the new MTU implies.
+  // The reference pre-grows its buffer for exactly this case at SetMtu time (kcp.go:1111-1121,
+  // upstream #348); this port sizes lazily at flush instead, with the same net contract: the
+  // segment still goes out intact, never truncated or dropped.
   auto ensure_capacity = [&](std::size_t need) {
     if (need <= capacity) {
       return;

@@ -562,6 +562,20 @@ int UdpSession::write_buffers(const std::vector<ConstBuffer>& bufs, std::error_c
       return Fail(ec, ErrorCode::kInvalidArgument);
     }
   }
+  // An empty write only reports the conn's state (sess.go:322-333): it neither flushes nor waits
+  // for the send window, so a caller probing liveness with a zero-length write must get an answer
+  // even when the pipe is full. The deadline plays no part in this branch.
+  if (total == 0) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (write_error_ != ErrorCode::kOk) {
+      return Fail(ec, write_error_);
+    }
+    if (closed_.load(std::memory_order_acquire)) {
+      return Fail(ec, ErrorCode::kClosedPipe);
+    }
+    Succeed(ec);
+    return 0;
+  }
   std::unique_lock<std::mutex> lock(mu_);
 
   for (;;) {

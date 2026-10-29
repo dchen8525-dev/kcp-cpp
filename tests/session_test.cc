@@ -1013,6 +1013,68 @@ void TestWriteBuffersRejectsOversizedBatch() {
   pair.server->close(nullptr);
 }
 
+// An empty write reports only the conn's state (sess.go:322-333): with the send window full it
+// must answer 0/kOk immediately instead of queueing behind the flow-control wait, and after
+// close() it must report kClosedPipe.
+void TestEmptyWriteReportsStateOnly() {
+  // A bound, never-read UDP endpoint as the dial target: a closed port would answer the client's
+  // first datagram with an ICMP unreachable (WSAECONNRESET here), turning the socket into a write
+  // error state and masking the window-full branch this test is about.
+  const kcp::platform::SocketHandle sink = kcp::platform::SysSocketUdp();
+  if (sink == kcp::platform::kInvalidSocket) {
+    Fail(__FILE__, __LINE__, "empty-write: sink socket creation failed");
+    return;
+  }
+  kcp::platform::SocketAddress bind_addr;
+  kcp::platform::SocketAddress::Parse("127.0.0.1", 0, &bind_addr);
+  kcp::platform::SocketAddress actual;
+  if (kcp::platform::SysBind(sink, bind_addr) != 0 ||
+      kcp::platform::SysGetSockName(sink, &actual) != 0) {
+    Fail(__FILE__, __LINE__, "empty-write: sink bind failed");
+    kcp::platform::SysClose(sink);
+    return;
+  }
+
+  std::error_code ec;
+  std::shared_ptr<UdpSession> client =
+      kcp::DialWithOptions(actual.ToString(), kcp::Crypt{}, 0, 0, &ec);
+  if (!client) {
+    Fail(__FILE__, __LINE__, "empty-write: dial failed: " + ec.message());
+    kcp::platform::SysClose(sink);
+    return;
+  }
+
+  // Shrink the window to one slot and fill it: the sink never ACKs, so wait_snd stays at
+  // snd_wnd and every non-empty write must block until the deadline.
+  client->SetWindowSize(1, 1);
+  const std::uint8_t byte = 0xAB;
+  if (client->write(&byte, 1, &ec) != 1) {
+    Fail(__FILE__, __LINE__, "empty-write: first write failed: " + ec.message());
+    client->close(nullptr);
+    kcp::platform::SysClose(sink);
+    return;
+  }
+  client->SetWriteDeadline(AfterMs(300));
+  if (client->write(&byte, 1, &ec) != -1 || ec != ErrorCode::kTimeout) {
+    Fail(__FILE__, __LINE__, "empty-write: second write did not block on the full window");
+  }
+
+  // The branch under test: an empty write ignores the (expired) deadline and the full window.
+  if (client->write(&byte, 0, &ec) != 0 || ec) {
+    Fail(__FILE__, __LINE__, "empty-write: empty write did not report 0/kOk: ec=" + ec.message());
+  }
+  if (client->write_buffers({}, &ec) != 0 || ec) {
+    Fail(__FILE__, __LINE__, "empty-write: empty batch did not report 0/kOk");
+  }
+
+  // After close the state report becomes kClosedPipe.
+  client->close(nullptr);
+  if (client->write(&byte, 0, &ec) != -1 || ec != ErrorCode::kClosedPipe) {
+    Fail(__FILE__, __LINE__, "empty-write: empty write after close did not report kClosedPipe");
+  }
+  kcp::platform::SysClose(sink);
+}
+
 }  // namespace
 
 int main() {
@@ -1038,6 +1100,7 @@ int main() {
   TestCurrEstabAccounting();
   TestProfilingCountersDoNotBreakTransfer();
   TestWriteBuffersRejectsOversizedBatch();
+  TestEmptyWriteReportsStateOnly();
 
   if (g_failures != 0) {
     std::fprintf(stderr, "session_test: %d failure(s)\n", g_failures);
